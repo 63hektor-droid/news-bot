@@ -30,6 +30,12 @@ jobs:
           path: ~/.cache/huggingface
           key: whisper-base-v1
 
+      - name: Cache Argos Translate model
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argos-en-fa-v1
+
       - name: Install requirements
         run: pip install -r requirements.txt
 
