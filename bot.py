@@ -333,15 +333,26 @@ def select(items, state):
 _DIG = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
 
+TRANSLATE_EMAIL = env("TRANSLATE_EMAIL", "63hektor@gmail.com")   # raises MyMemory daily quota 5000 -> 50000 chars
+
+
 def _gt(text):
-    from deep_translator import GoogleTranslator
+    from deep_translator import MyMemoryTranslator, GoogleTranslator
     last = None
     for i in range(3):
         try:
-            return GoogleTranslator(source="auto", target="fa").translate(text)
+            time.sleep(2.5)
+            kwargs = dict(source="en", target="fa")
+            if TRANSLATE_EMAIL:
+                kwargs["email"] = TRANSLATE_EMAIL
+            return MyMemoryTranslator(**kwargs).translate(text)
         except Exception as ex:                                  # noqa
             last = ex
             time.sleep(2 + 2 * i)
+    try:
+        return GoogleTranslator(source="auto", target="fa").translate(text)
+    except Exception as ex:                                      # noqa
+        last = ex
     raise last
 
 
