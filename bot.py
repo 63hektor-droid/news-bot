@@ -622,6 +622,74 @@ def og_image(url):
     return None
 
 
+# ---- image validation ------------------------------------------------
+# Goal: never attach a picture that isn't really the specific photo for
+# that specific story - no generic site logos/icons, no tiny placeholder
+# pixels, no broken links. Every candidate image (whether it came from the
+# RSS entry or was scraped from the article page) is checked here before
+# it's allowed to be posted; a candidate that fails is simply skipped and
+# the next one is tried, so a bad match never silently goes out.
+GENERIC_IMG_PAT = re.compile(
+    r"(logo|sprite|placeholder|default[-_]?image|avatar|favicon|"
+    r"blank\.gif|spacer|1x1|pixel\.gif|icon[-_]|masthead|site-image)",
+    re.I,
+)
+
+
+def img_looks_generic(url):
+    return bool(url) and bool(GENERIC_IMG_PAT.search(url))
+
+
+def img_ok(url):
+    """True only if `url` is reachable, is really an image, and is large
+    enough to be an actual news photo rather than an icon/logo."""
+    if not url or img_looks_generic(url):
+        return False
+    try:
+        import requests
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=8, stream=True)
+        try:
+            if r.status_code != 200:
+                return False
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if not ctype.startswith("image/") or "svg" in ctype:
+                return False
+            clen = int(r.headers.get("Content-Length") or 0)
+            if clen and clen < 8000:          # icons/logos are typically tiny
+                return False
+            chunk = r.raw.read(262144, decode_content=True)
+            if len(chunk) < 8000 and not clen:
+                return False
+            try:
+                from PIL import Image
+                import io
+                w, h = Image.open(io.BytesIO(chunk)).size
+                if w < 300 or h < 200:        # too small to be a real article photo
+                    return False
+            except Exception:                                    # noqa
+                pass                          # Pillow unavailable/undecodable header - fall back to size checks above
+            return True
+        finally:
+            r.close()
+    except Exception:
+        return False
+
+
+def image_candidates(item):
+    """Yield validated image URLs for this specific item, best first: the
+    RSS-supplied image (fast, already item-specific) then, if that fails
+    validation, the og:image scraped straight from this item's own article
+    page (skipped for Google News redirect links, which aren't real
+    article pages)."""
+    rss_img = item.get("img")
+    if rss_img and img_ok(rss_img):
+        yield rss_img
+    if "news.google.com" not in item["link"]:
+        scraped = og_image(item["link"])
+        if scraped and scraped != rss_img and img_ok(scraped):
+            yield scraped
+
+
 def send_text(text):
     return tg("sendMessage", dict(chat_id=CHANNEL_ID, text=text, parse_mode="HTML",
                                   disable_web_page_preview="true"))
@@ -657,20 +725,29 @@ def run(cmd, timeout):
 
 
 def ensure_tools():
+    """Returns the Persian font family to burn subtitles with, or None if
+    ffmpeg or a real Persian font couldn't be made available. Falling back
+    to a non-Persian font (e.g. DejaVu Sans) would burn broken/undisplayable
+    text into the video, which is worse than no subtitles - so the caller
+    must skip burning entirely when this returns None."""
     if not shutil.which("ffmpeg"):
         log("installing ffmpeg ...")
         run(["bash", "-c", "sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg"], 240)
+    if not shutil.which("ffmpeg"):
+        log("ERROR: ffmpeg still not available after install attempt - cannot burn subtitles")
+        return None
     fams = run(["bash", "-c", "fc-list :lang=fa family || true"], 30).stdout
     if "Vazir" not in fams and "Naskh" not in fams:
         log("installing Persian fonts ...")
         run(["bash", "-c", "sudo apt-get install -y -qq fonts-vazirmatn fonts-noto-core "
              "|| sudo apt-get install -y -qq fonts-noto-core"], 240)
-    fams = run(["bash", "-c", "fc-list :lang=fa family || true"], 30).stdout
+        fams = run(["bash", "-c", "fc-list :lang=fa family || true"], 30).stdout
     if "Vazir" in fams:
         return "Vazirmatn"
     if "Naskh" in fams:
         return "Noto Naskh Arabic"
-    return "DejaVu Sans"
+    log("ERROR: no Persian font available after install attempt - cannot burn readable Persian subtitles")
+    return None
 
 
 def download(url, path):
@@ -786,6 +863,9 @@ def make_video(item, tmp):
         log("video rejected (size/duration):", w, h, dur)
         return None
     font = ensure_tools()
+    if not font:
+        log("skipping subtitles for this video: no usable ffmpeg/Persian font")
+        return src, w, h, dur, False
     segs = []
     if has_audio and left() > 120:
         wav = os.path.join(tmp, "a.wav")
@@ -931,8 +1011,7 @@ def post_item(item, allow_video):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    img = item.get("img") or og_image(item["link"])
-    if img:
+    for img in image_candidates(item):
         if send_photo(img, build_post(item, title_fa, sum_fa, 1000)):
             return "photo"
     if send_text(build_post(item, title_fa, sum_fa, 3900)):
@@ -965,9 +1044,11 @@ def main():
     for c in chosen[:10]:
         log("  [%2d] %s (%s) %s" % (c["total"], c["src"], c["tier"], c["title"][:90]))
 
-    # normal items first, the (slow) video item last
+    # the (slow) video item goes first so its subtitling pipeline always
+    # gets the full time budget, instead of whatever's left after the
+    # other posts' translation retries/sleeps have eaten into it
     todo = chosen[:MAX_POSTS]
-    todo.sort(key=lambda x: 1 if (x.get("video") or x.get("page_video")) else 0)
+    todo.sort(key=lambda x: 0 if (x.get("video") or x.get("page_video")) else 1)
     posted, videos = 0, 0
     for i, it in enumerate(todo):
         if left() < 25:
@@ -975,6 +1056,9 @@ def main():
             break
         try:
             allow_video = ENABLE_VIDEO and videos < MAX_VIDEOS and left() > 200
+            if (it.get("video") or it.get("page_video")) and not allow_video:
+                log("video item won't get subtitles this run (enabled=%s, videos_used=%d, time_left=%ds)"
+                    % (ENABLE_VIDEO, videos, left()))
             res = post_item(it, allow_video)
         except Exception:                                        # noqa
             log("post failed:\n" + traceback.format_exc()[-600:])
