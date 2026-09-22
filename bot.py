@@ -336,21 +336,101 @@ _DIG = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 TRANSLATE_EMAIL = env("TRANSLATE_EMAIL", "63hektor@gmail.com")   # raises MyMemory daily quota 5000 -> 50000 chars
 
 
+LIBRE_MIRRORS = (
+    "https://libretranslate.de/translate",
+    "https://translate.terraprint.co/translate",
+    "https://libretranslate.com/translate",
+)
+
+
+def _libre(text):
+    import random
+    import requests
+    last = None
+    for base in LIBRE_MIRRORS:
+        try:
+            r = requests.post(
+                base,
+                data={"q": text, "source": "en", "target": "fa", "format": "text"},
+                timeout=20,
+            )
+            j = r.json()
+            out = j.get("translatedText")
+            if out:
+                return out
+            last = RuntimeError(str(j)[:150])
+        except Exception as ex:                                  # noqa
+            last = ex
+            log("LibreTranslate (%s) failed: %s" % (base, str(ex)[:150]))
+        time.sleep(1 + random.uniform(0, 1))
+    raise last
+
+
+_ARGOS_READY = False
+
+
+def _argos_init():
+    """Download + install the en->fa Argos model once (cached for the rest
+    of this process). Runs entirely offline once installed - no per-request
+    network call, so it can never be rate-limited."""
+    global _ARGOS_READY
+    if _ARGOS_READY:
+        return
+    import argostranslate.package
+    import argostranslate.translate
+    have = {l.code for l in argostranslate.translate.get_installed_languages()}
+    if not ({"en", "fa"} <= have):
+        argostranslate.package.update_package_index()
+        pkgs = argostranslate.package.get_available_packages()
+        pkg = next(p for p in pkgs if p.from_code == "en" and p.to_code == "fa")
+        argostranslate.package.install_from_path(pkg.download())
+    _ARGOS_READY = True
+
+
+def _argos(text):
+    import argostranslate.translate
+    _argos_init()
+    out = argostranslate.translate.translate(text, "en", "fa")
+    if not out or not out.strip():
+        raise RuntimeError("argos returned empty output")
+    return out
+
+
 def _gt(text):
     from deep_translator import MyMemoryTranslator, GoogleTranslator
+    import random
     last = None
+    # 0) Argos Translate - offline, free, no key, no rate limit. Primary choice.
+    try:
+        return _argos(text)
+    except Exception as ex:                                      # noqa
+        last = ex
+        log("Argos failed, falling back to online translators: %s" % str(ex)[:200])
+    # 1) MyMemory - primary online fallback, has a raised daily quota via TRANSLATE_EMAIL
     for i in range(3):
         try:
-            time.sleep(2.5)
+            time.sleep(2.5 + random.uniform(0, 1.5))
             kwargs = dict(source="en", target="fa")
             if TRANSLATE_EMAIL:
                 kwargs["email"] = TRANSLATE_EMAIL
             return MyMemoryTranslator(**kwargs).translate(text)
         except Exception as ex:                                  # noqa
             last = ex
-            time.sleep(2 + 2 * i)
+            log("MyMemory failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
+            time.sleep(3 + 3 * i + random.uniform(0, 2))
+    # 2) Google - fallback, its own short retry with backoff + jitter
+    for i in range(2):
+        try:
+            time.sleep(1.5 + random.uniform(0, 1.5))
+            return GoogleTranslator(source="auto", target="fa").translate(text)
+        except Exception as ex:                                  # noqa
+            last = ex
+            log("Google failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
+            time.sleep(5 + 5 * i + random.uniform(0, 3))
+    # 3) LibreTranslate - different infra than Google/MyMemory, so a shared
+    #    GitHub Actions IP getting rate-limited on one doesn't sink every post
     try:
-        return GoogleTranslator(source="auto", target="fa").translate(text)
+        return _libre(text)
     except Exception as ex:                                      # noqa
         last = ex
     raise last
