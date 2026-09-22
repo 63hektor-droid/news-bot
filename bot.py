@@ -29,6 +29,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import data
 
@@ -186,6 +187,31 @@ def toks(title):
     return {w[:6] for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 3 and w not in STOP}
 
 
+# query/fragment params that don't change what article a link points to, but
+# vary between fetches of the same story (analytics, sharing, session ids) -
+# left un-stripped, they defeated exact-URL duplicate detection and were a
+# real source of the same story getting posted more than once.
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+    "utm_id", "utm_name", "utm_social", "utm_social-type",
+    "ref", "ref_src", "ref_url", "fbclid", "gclid", "msclkid",
+    "cmpid", "cmp", "intcid", "ito", "ns_campaign", "ns_mchannel",
+    "ns_source", "ns_linkname", "ns_fee", "src", "sref", "traffic_source",
+    "CMP", "at_medium", "at_campaign", "xtor", "spref", "__twitter_impression",
+}
+
+
+def normalize_link(url):
+    try:
+        parts = urlsplit(url.strip())
+        q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in TRACKING_PARAMS and not k.lower().startswith("utm_")]
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, urlencode(q), ""))
+    except Exception:                                              # noqa
+        return url.strip()
+
+
 def similar(a, b):
     if not a or not b:
         return False
@@ -248,7 +274,7 @@ def fetch_feed(src, url):
     out = []
     for e in fp.entries[:60]:
         title = clean_text(e.get("title", ""))
-        link = (e.get("link") or "").strip()
+        link = normalize_link((e.get("link") or "").strip())
         if not title or not link:
             continue
         if gnews:
@@ -264,7 +290,12 @@ def fetch_feed(src, url):
                 t = datetime.fromtimestamp(calendar.timegm(e[k]), tz=timezone.utc)
                 break
         if t is None:
-            t = datetime.now(timezone.utc)
+            # no real publish/update time from the feed - defaulting to
+            # "now" here used to make the same-day (Tehran) filter a no-op
+            # for these entries, letting undated items through regardless
+            # of their actual age. Skip instead: "definitely today" can't
+            # be confirmed without a real timestamp.
+            continue
         img, vid = entry_media(e)
         page_video = bool(re.search(r"/videos?/|/video-|/watch", link)) and not gnews
         out.append(dict(title=title, summary=summ[:900], link=link, time=t, src=src["name"],
@@ -438,25 +469,45 @@ def _gt(text):
             last = ex
             log("MyMemory failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
             time.sleep(3 + 3 * i + random.uniform(0, 2))
-    # 2) Argos Translate - offline, free, no key, no rate limit. Lower fluency
-    #    than Google/MyMemory, so it's kept as the safety net for when both
-    #    online engines are rate-limited, not the default.
-    try:
-        return _argos(text)
-    except Exception as ex:                                      # noqa
-        last = ex
-        log("Argos failed too: %s" % str(ex)[:200])
-    # 3) LibreTranslate - different infra than Google/MyMemory, last resort
+    # 2) LibreTranslate - different infra than Google/MyMemory, still a
+    #    real neural MT engine so noticeably more fluent than the offline
+    #    fallback below; tried before Argos for that reason.
     try:
         return _libre(text)
+    except Exception as ex:                                      # noqa
+        last = ex
+        log("LibreTranslate failed too: %s" % str(ex)[:200])
+    # 3) Argos Translate - offline, free, no key, no rate limit. Lowest
+    #    fluency of the four, so it's the true last resort, used only when
+    #    every online option above is unreachable.
+    try:
+        return _argos(text)
     except Exception as ex:                                      # noqa
         last = ex
     raise last
 
 
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
 def fix_fa(s):
     s = s.replace("ي", "ی").replace("ك", "ک")
+    # Persian punctuation marks instead of the Latin ones free translators
+    # often leave behind (real "رعایت نگارش فارسی" issue, not cosmetic)
+    s = re.sub(r"(?<=[آ-ی۰-۹])\s*\?", "؟", s)
+    s = re.sub(r"(?<=[آ-ی۰-۹])\s*;", "؛", s)
+    # a "," only turns into "،" when it's between/after Persian text, not
+    # inside a number like 12,000 or a still-Latin abbreviation
+    s = re.sub(r"(?<=[آ-ی])\s*,\s*", "، ", s)
     s = re.sub(r"\s+([،؛:!؟.])", r"\1", s)
+    # Persian digits, but never inside a URL/link (leave those untouched)
+    parts = re.split(r"(https?://\S+)", s)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"\d+", lambda m: m.group(0).translate(_FA_DIGITS), parts[i])
+    s = "".join(parts)
+    # one space after sentence/clause punctuation when text runs on without one
+    s = re.sub(r"([،؛:؟!])(?=[آ-یA-Za-z0-9])", r"\1 ", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
     # proper Persian half-space (ZWNJ) in common compounds, instead of the
     # full space free translators usually leave (bad Persian typography)
     s = re.sub(r"\b(می|نمی)\s+(?=[آ-ی])", "\\1\u200c", s)
@@ -745,15 +796,33 @@ def make_video(item, tmp):
             it, info = model.transcribe(wav, vad_filter=True, beam_size=1)
             log("whisper language:", info.language)
             if info.language != "fa":
+                raw = []
                 for s in it:
-                    if left() < 60:
-                        break
                     tx = s.text.strip()
                     if len(tx) < 2:
                         continue
-                    fa = translate(tx)
+                    raw.append((s.start, s.end, tx))
+                # merge short/fragmented segments into fuller phrases before
+                # translating each one - translating single disjointed
+                # fragments in isolation (e.g. "and then", "the president")
+                # produced choppy, incoherent subtitles; giving the
+                # translator a fuller phrase for context makes each line
+                # noticeably more fluent. Only merges across small gaps, so
+                # it doesn't glue together unrelated sentences after a pause.
+                groups = []
+                for start, end, tx in raw:
+                    if (groups and len(groups[-1][2]) < 40
+                            and start - groups[-1][1] < 1.2):
+                        gs, ge, gt = groups[-1]
+                        groups[-1] = (gs, end, (gt + " " + tx).strip())
+                    else:
+                        groups.append((start, end, tx))
+                for gs, ge, gt in groups:
+                    if left() < 60:
+                        break
+                    fa = translate(gt)
                     if fa:
-                        segs.append((s.start, max(s.end, s.start + 1.0), fa))
+                        segs.append((gs, max(ge, gs + 1.0), fa))
         except Exception as ex:                                  # noqa
             log("whisper failed:", str(ex)[:200])
             segs = []
@@ -804,6 +873,33 @@ def save_state(s):
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False)
+
+
+def git_push_state(state):
+    """Commit + push state/posted.json right now, not just at the end of the
+    workflow. If the job dies mid-run (15-min timeout, crash, cancelled
+    runner) after some posts already went to Telegram, this is what keeps
+    those posts recorded - otherwise the next run re-selects and re-posts
+    them, which is what was causing the duplicates."""
+    save_state(state)
+    try:
+        subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
+        subprocess.run(["git", "config", "user.email", "news-bot@users.noreply.github.com"], check=False)
+        subprocess.run(["git", "add", "state"], check=False)
+        if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+            return  # nothing changed, nothing to push
+        subprocess.run(["git", "commit", "-m", "state [skip ci]"], check=False)
+        for i in range(5):
+            pulled = subprocess.run(["git", "pull", "--rebase", "-q"]).returncode == 0
+            pushed = subprocess.run(["git", "push", "-q"]).returncode == 0
+            if pulled and pushed:
+                return
+            log("state push attempt %d failed, retrying..." % (i + 1))
+            time.sleep((i + 1) * 5)
+        log("WARNING: failed to push state after retries - post already sent to Telegram, "
+            "risk of duplicate on next run")
+    except Exception as ex:                                        # noqa
+        log("git push error: %s" % str(ex)[:200])
 
 
 # =====================================================================
@@ -888,7 +984,10 @@ def main():
             videos += 1 if res == "video" else 0
             state["urls"] += [it["link"]] + it["dups"]
             state["titles"].append(sorted(it["tk"]))
-            save_state(state)
+            if DRY_RUN:
+                save_state(state)
+            else:
+                git_push_state(state)
             log("posted (%s): %s" % (res, it["title"][:80]))
         if i < len(todo) - 1 and POST_GAP > 0 and left() > POST_GAP + 30 and not DRY_RUN:
             time.sleep(POST_GAP)
