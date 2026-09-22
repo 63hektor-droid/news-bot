@@ -417,12 +417,20 @@ def _gt(text):
         except Exception as ex:                                  # noqa
             last = ex
             log("Google failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
-            time.sleep(5 + 5 * i + random.uniform(0, 3))
-    # 1) MyMemory - second online option, has a raised daily quota via TRANSLATE_EMAIL
+            # 429s from the free endpoint need a longer, exponential backoff,
+            # especially on shared CI IPs (GitHub Actions runners) that get
+            # rate-limited fast; short sleeps just burn through retries.
+            is_429 = "429" in str(ex) or "too many requests" in str(ex).lower()
+            base = 15 if is_429 else 5
+            time.sleep(base * (2 ** i) + random.uniform(0, 3))
+    # 1) MyMemory - second online option, has a raised daily quota via TRANSLATE_EMAIL.
+    #    deep_translator's MyMemoryTranslator needs locale-style codes
+    #    (e.g. "en-GB", "fa-IR"), not bare "en"/"fa" - that's what was
+    #    causing "No support for the provided language" on every attempt.
     for i in range(3):
         try:
             time.sleep(2.5 + random.uniform(0, 1.5))
-            kwargs = dict(source="en", target="fa")
+            kwargs = dict(source="en-GB", target="fa-IR")
             if TRANSLATE_EMAIL:
                 kwargs["email"] = TRANSLATE_EMAIL
             return MyMemoryTranslator(**kwargs).translate(text)
@@ -451,9 +459,9 @@ def fix_fa(s):
     s = re.sub(r"\s+([،؛:!؟.])", r"\1", s)
     # proper Persian half-space (ZWNJ) in common compounds, instead of the
     # full space free translators usually leave (bad Persian typography)
-    s = re.sub(r"\b(می|نمی)\s+(?=[آ-ی])", r"\1\u200c", s)
-    s = re.sub(r"(?<=[آ-ی])\s+(ها|های)\b", r"\u200c\1", s)
-    s = re.sub(r"(?<=[آ-ی])\s+(تر|ترین)\b", r"\u200c\1", s)
+    s = re.sub(r"\b(می|نمی)\s+(?=[آ-ی])", "\\1\u200c", s)
+    s = re.sub(r"(?<=[آ-ی])\s+(ها|های)\b", "\u200c\\1", s)
+    s = re.sub(r"(?<=[آ-ی])\s+(تر|ترین)\b", "\u200c\\1", s)
     return s.strip()
 
 
