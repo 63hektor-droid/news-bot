@@ -845,6 +845,32 @@ def build_ass(segs, w, h, font, path):
         f.write(head + "\n".join(lines) + "\n")
 
 
+def detect_page_video(link):
+    """RSS entries rarely carry a video enclosure, and most video-led
+    articles (Guardian, DW, ...) don't have '/video/' or '/watch' in their
+    URL either - they just embed a YouTube/Vimeo/Brightcove/JW player in
+    the page with JS. That combination meant page_video was almost never
+    True, so the video pipeline was never even attempted for these. Fetch
+    the article page itself and look for real embed signals; yt-dlp's
+    generic extractor can pull the video out of the link once we know one
+    is actually there. Only called for the few items about to be posted,
+    not for every RSS entry, so the extra request is cheap."""
+    try:
+        import requests
+        r = requests.get(link, headers={"User-Agent": UA}, timeout=15)
+        if r.status_code != 200:
+            return False
+        body = r.text[:400000].lower()
+    except Exception as ex:                                      # noqa
+        log("page fetch for video-detect failed:", str(ex)[:100])
+        return False
+    signals = (
+        "og:video", '"videoobject"', "youtube.com/embed", "youtube-nocookie.com/embed",
+        "player.vimeo.com", "brightcove", "jwplayer", "<video",
+    )
+    return any(s in body for s in signals)
+
+
 def make_video(item, tmp):
     """Returns (path, w, h, dur, subtitled) or None."""
     src = os.path.join(tmp, "in.mp4")
@@ -994,6 +1020,11 @@ def post_item(item, allow_video):
     if DRY_RUN:
         log("---- DRY RUN ----\n" + build_post(item, title_fa, sum_fa, 1000))
         return True
+
+    if allow_video and ENABLE_VIDEO and not (item.get("video") or item.get("page_video")):
+        if detect_page_video(item["link"]):
+            item["page_video"] = True
+            log("video detected on article page (not in RSS/URL):", item["link"][:90])
 
     if allow_video and ENABLE_VIDEO and (item.get("video") or item.get("page_video")):
         tmp = tempfile.mkdtemp(prefix="vid")
