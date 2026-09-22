@@ -3,3 +3,4 @@ feedparser
 deep-translator
 faster-whisper
 yt-dlp
+argostranslate
