@@ -28,6 +28,7 @@ import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import data
 
@@ -44,7 +45,8 @@ CHANNEL_ID = env("CHANNEL_ID", "")
 MAX_POSTS = int(env("MAX_POSTS_PER_RUN", 3))      # 3 posts per 5 min ~ 864/day max
 POST_GAP = int(env("POST_GAP_SEC", 90))           # spacing so posts arrive ~ every 1.5-2 min
 MIN_SCORE = int(env("MIN_SCORE", 4))
-MAX_AGE_H = float(env("MAX_AGE_HOURS", 8))
+MAX_AGE_H = float(env("MAX_AGE_HOURS", 8))       # kept for reference; day-filter below is authoritative
+TEHRAN = ZoneInfo("Asia/Tehran")
 TIME_BUDGET = int(env("TIME_BUDGET_SEC", 280))
 ENABLE_VIDEO = env("ENABLE_VIDEO", "1") == "1"
 MAX_VIDEOS = int(env("MAX_VIDEOS_PER_RUN", 1))
@@ -188,7 +190,10 @@ def similar(a, b):
     if not a or not b:
         return False
     inter = len(a & b)
-    return inter >= 4 and inter / max(1, min(len(a), len(b))) >= 0.55
+    if inter >= 6:                       # lots of shared tokens -> same story, phrasing aside
+        return True
+    ratio = inter / max(1, min(len(a), len(b)))
+    return inter >= 3 and ratio >= 0.5
 
 
 # =====================================================================
@@ -294,12 +299,15 @@ def select(items, state):
     seen = set(state["urls"])
     old = [set(t) for t in state["titles"]]
     now = datetime.now(timezone.utc)
+    today_ir = now.astimezone(TEHRAN).date()
     pool = []
     for it in items:
         if it["link"] in seen:
             continue
         age = (now - it["time"]).total_seconds() / 3600.0
-        if age > MAX_AGE_H or age < -1:
+        if age < -1:                                   # clock-skew / future timestamp
+            continue
+        if it["time"].astimezone(TEHRAN).date() != today_ir:   # only today's news (Iran time)
             continue
         a = analyze(it["title"], it["summary"])
         if not a["ok"]:
