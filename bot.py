@@ -408,13 +408,17 @@ def _gt(text):
     from deep_translator import MyMemoryTranslator, GoogleTranslator
     import random
     last = None
-    # 0) Argos Translate - offline, free, no key, no rate limit. Primary choice.
-    try:
-        return _argos(text)
-    except Exception as ex:                                      # noqa
-        last = ex
-        log("Argos failed, falling back to online translators: %s" % str(ex)[:200])
-    # 1) MyMemory - primary online fallback, has a raised daily quota via TRANSLATE_EMAIL
+    # 0) Google - free, no key; by far the most fluent Persian output of the
+    #    free options, so it's the default choice whenever it's reachable.
+    for i in range(2):
+        try:
+            time.sleep(1.5 + random.uniform(0, 1.5))
+            return GoogleTranslator(source="auto", target="fa").translate(text)
+        except Exception as ex:                                  # noqa
+            last = ex
+            log("Google failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
+            time.sleep(5 + 5 * i + random.uniform(0, 3))
+    # 1) MyMemory - second online option, has a raised daily quota via TRANSLATE_EMAIL
     for i in range(3):
         try:
             time.sleep(2.5 + random.uniform(0, 1.5))
@@ -426,17 +430,15 @@ def _gt(text):
             last = ex
             log("MyMemory failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
             time.sleep(3 + 3 * i + random.uniform(0, 2))
-    # 2) Google - fallback, its own short retry with backoff + jitter
-    for i in range(2):
-        try:
-            time.sleep(1.5 + random.uniform(0, 1.5))
-            return GoogleTranslator(source="auto", target="fa").translate(text)
-        except Exception as ex:                                  # noqa
-            last = ex
-            log("Google failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
-            time.sleep(5 + 5 * i + random.uniform(0, 3))
-    # 3) LibreTranslate - different infra than Google/MyMemory, so a shared
-    #    GitHub Actions IP getting rate-limited on one doesn't sink every post
+    # 2) Argos Translate - offline, free, no key, no rate limit. Lower fluency
+    #    than Google/MyMemory, so it's kept as the safety net for when both
+    #    online engines are rate-limited, not the default.
+    try:
+        return _argos(text)
+    except Exception as ex:                                      # noqa
+        last = ex
+        log("Argos failed too: %s" % str(ex)[:200])
+    # 3) LibreTranslate - different infra than Google/MyMemory, last resort
     try:
         return _libre(text)
     except Exception as ex:                                      # noqa
@@ -447,6 +449,11 @@ def _gt(text):
 def fix_fa(s):
     s = s.replace("ي", "ی").replace("ك", "ک")
     s = re.sub(r"\s+([،؛:!؟.])", r"\1", s)
+    # proper Persian half-space (ZWNJ) in common compounds, instead of the
+    # full space free translators usually leave (bad Persian typography)
+    s = re.sub(r"\b(می|نمی)\s+(?=[آ-ی])", r"\1\u200c", s)
+    s = re.sub(r"(?<=[آ-ی])\s+(ها|های)\b", r"\u200c\1", s)
+    s = re.sub(r"(?<=[آ-ی])\s+(تر|ترین)\b", r"\u200c\1", s)
     return s.strip()
 
 
