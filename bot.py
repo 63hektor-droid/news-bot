@@ -488,6 +488,22 @@ def _argos(text):
     return out
 
 
+def _looks_translated(out):
+    """A cheap accuracy check: catches the case where a backend returns
+    ok=True with the source text basically unchanged (rate-limited/broken
+    endpoints do this silently rather than raising) - that used to slip
+    through as a "successful" translation that was actually still
+    English. Short strings (a name, an acronym) can legitimately stay
+    mostly Latin, so only flag longer output that's still majority Latin."""
+    if not out or not out.strip():
+        return False
+    if len(out) < 15:
+        return True
+    fa = len(re.findall(r"[آ-ی]", out))
+    lat = len(re.findall(r"[A-Za-z]", out))
+    return fa >= lat
+
+
 def _gt(text):
     from deep_translator import MyMemoryTranslator, GoogleTranslator
     import random
@@ -497,7 +513,12 @@ def _gt(text):
     for i in range(2):
         try:
             time.sleep(1.5 + random.uniform(0, 1.5))
-            return GoogleTranslator(source="auto", target="fa").translate(text)
+            out = GoogleTranslator(source="auto", target="fa").translate(text)
+            if _looks_translated(out):
+                return out
+            last = RuntimeError("Google returned non-Persian/unchanged text")
+            log("Google output failed the Persian-content check, trying next engine")
+            break
         except Exception as ex:                                  # noqa
             last = ex
             log("Google failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
@@ -517,7 +538,12 @@ def _gt(text):
             kwargs = dict(source="en-GB", target="fa-IR")
             if TRANSLATE_EMAIL:
                 kwargs["email"] = TRANSLATE_EMAIL
-            return MyMemoryTranslator(**kwargs).translate(text)
+            out = MyMemoryTranslator(**kwargs).translate(text)
+            if _looks_translated(out):
+                return out
+            last = RuntimeError("MyMemory returned non-Persian/unchanged text")
+            log("MyMemory output failed the Persian-content check, trying next engine")
+            break
         except Exception as ex:                                  # noqa
             last = ex
             log("MyMemory failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
@@ -526,13 +552,17 @@ def _gt(text):
     #    real neural MT engine so noticeably more fluent than the offline
     #    fallback below; tried before Argos for that reason.
     try:
-        return _libre(text)
+        out = _libre(text)
+        if _looks_translated(out):
+            return out
+        last = RuntimeError("LibreTranslate returned non-Persian/unchanged text")
+        log("LibreTranslate output failed the Persian-content check, falling back to Argos")
     except Exception as ex:                                      # noqa
         last = ex
         log("LibreTranslate failed too: %s" % str(ex)[:200])
     # 3) Argos Translate - offline, free, no key, no rate limit. Lowest
     #    fluency of the four, so it's the true last resort, used only when
-    #    every online option above is unreachable.
+    #    every online option above is unreachable or unusable.
     try:
         return _argos(text)
     except Exception as ex:                                      # noqa
@@ -553,11 +583,23 @@ def fix_fa(s):
     # inside a number like 12,000 or a still-Latin abbreviation
     s = re.sub(r"(?<=[آ-ی])\s*,\s*", "، ", s)
     s = re.sub(r"\s+([،؛:!؟.])", r"\1", s)
+    # straight double quotes -> paired Persian guillemets, alternating
+    # open/close so a translated quote reads as Persian typography instead
+    # of the Latin " the translators leave behind
+    _q = {"n": 0}
+
+    def _quote(_m):
+        _q["n"] += 1
+        return "«" if _q["n"] % 2 else "»"
+    s = re.sub(r'"', _quote, s)
     # Persian digits, but never inside a URL/link (leave those untouched)
     parts = re.split(r"(https?://\S+)", s)
     for i in range(0, len(parts), 2):
         parts[i] = re.sub(r"\d+", lambda m: m.group(0).translate(_FA_DIGITS), parts[i])
     s = "".join(parts)
+    # percent sign glued to its number with no space, Persian-style, and
+    # written as ٪ rather than the Latin %
+    s = re.sub(r"(?<=[۰-۹])\s*%", "٪", s)
     # one space after sentence/clause punctuation when text runs on without one
     s = re.sub(r"([،؛:؟!])(?=[آ-یA-Za-z0-9])", r"\1 ", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
@@ -566,6 +608,7 @@ def fix_fa(s):
     s = re.sub(r"\b(می|نمی)\s+(?=[آ-ی])", "\\1\u200c", s)
     s = re.sub(r"(?<=[آ-ی])\s+(ها|های)\b", "\u200c\\1", s)
     s = re.sub(r"(?<=[آ-ی])\s+(تر|ترین)\b", "\u200c\\1", s)
+    s = re.sub(r"\bبی\s+(?=[آ-ی]{2,})", "بی\u200c", s)
     return s.strip()
 
 
@@ -728,18 +771,35 @@ def img_ok(url):
         return False
 
 
-def image_candidates(item):
+def norm_img(url):
+    """Netloc + path only (no query string) - enough to catch the same
+    picture being handed out again with a different cache-busting query
+    string, without needing to download and hash the bytes."""
+    try:
+        p = urlsplit(url)
+        return (p.netloc.lower() + p.path).rstrip("/")
+    except Exception:                                              # noqa
+        return url
+
+
+def image_candidates(item, used_images):
     """Yield validated image URLs for this specific item, best first: the
     RSS-supplied image (fast, already item-specific) then, if that fails
     validation, the og:image scraped straight from this item's own article
     page (skipped for Google News redirect links, which aren't real
-    article pages)."""
+    article pages). Anything already used for an earlier, different story
+    is skipped - some sites fall back to one generic "featured image" (a
+    section banner, a live-blog cover, ...) for articles that don't have
+    their own photo, and that generic image isn't always caught by the
+    logo/icon filter in img_ok(), so several unrelated stories were being
+    posted with the same picture."""
+    seen = {norm_img(u) for u in used_images}
     rss_img = item.get("img")
-    if rss_img and img_ok(rss_img):
+    if rss_img and norm_img(rss_img) not in seen and img_ok(rss_img):
         yield rss_img
     if "news.google.com" not in item["link"]:
         scraped = og_image(item["link"])
-        if scraped and scraped != rss_img and img_ok(scraped):
+        if scraped and scraped != rss_img and norm_img(scraped) not in seen and img_ok(scraped):
             yield scraped
 
 
@@ -937,13 +997,22 @@ def make_video(item, tmp):
         src = p
     else:
         return None
+    # ensure_tools() installs ffmpeg (which provides ffprobe) as a side
+    # effect - it has to run before probe() below, not after. probe() was
+    # being called first, so on any runner image that doesn't already have
+    # ffmpeg preinstalled, ffprobe was simply missing and every single
+    # video died right here with no post ever going out - this is very
+    # likely why no video has ever landed in the channel.
+    font = ensure_tools()
+    if not shutil.which("ffmpeg"):
+        log("no ffmpeg available even after install attempt - cannot post this video")
+        return None
     w, h, dur, has_audio = probe(src)
     if not w or not h or dur <= 0 or dur > MAX_VIDEO_SEC + 5:
         log("video rejected (size/duration):", w, h, dur)
         return None
-    font = ensure_tools()
     if not font:
-        log("skipping subtitles for this video: no usable ffmpeg/Persian font")
+        log("skipping subtitles for this video: no Persian font available")
         return src, w, h, dur, False
     segs = []
     if has_audio and left() > 120:
@@ -1021,17 +1090,47 @@ def load_state():
             s = json.load(f)
         s.setdefault("urls", [])
         s.setdefault("titles", [])
+        s.setdefault("images", [])
         return s
     except Exception:                                            # noqa
-        return {"urls": [], "titles": []}
+        return {"urls": [], "titles": [], "images": []}
 
 
 def save_state(s):
     s["urls"] = s["urls"][-4000:]
     s["titles"] = s["titles"][-500:]
+    s["images"] = s.get("images", [])[-500:]
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False)
+
+
+def git_pull_quiet():
+    try:
+        subprocess.run(["git", "pull", "--rebase", "-q"], check=False, timeout=30)
+    except Exception as ex:                                        # noqa
+        log("git pull before posting failed: %s" % str(ex)[:150])
+
+
+def refresh_seen(state):
+    """Re-read state/posted.json from disk (after a git pull) right before
+    posting, and merge it into the in-memory state. Two runs can overlap
+    (the schedule fires every few minutes but a run with a video can take
+    most of TIME_BUDGET_SEC), and the in-memory state loaded at the start
+    of *this* run goes stale the moment another run pushes in the
+    meantime - that overlap, not a hole in the similarity/URL de-dup
+    logic itself, is what was letting the same story slip through twice."""
+    git_pull_quiet()
+    fresh = load_state()
+    for u in fresh.get("urls", []):
+        if u not in state["urls"]:
+            state["urls"].append(u)
+    for t in fresh.get("titles", []):
+        if t not in state["titles"]:
+            state["titles"].append(t)
+    for im in fresh.get("images", []):
+        if im not in state.get("images", []):
+            state.setdefault("images", []).append(im)
 
 
 def git_push_state(state):
@@ -1064,7 +1163,7 @@ def git_push_state(state):
 # =====================================================================
 #  Posting one item
 # =====================================================================
-def post_item(item, allow_video):
+def post_item(item, allow_video, state):
     title_fa = translate(item["title"])
     sum_fa = translate(item["summary"]) if item["summary"] else ""
     if not title_fa:
@@ -1095,8 +1194,9 @@ def post_item(item, allow_video):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    for img in image_candidates(item):
+    for img in image_candidates(item, state.get("images", [])):
         if send_photo(img, build_post(item, title_fa, sum_fa, 1000)):
+            state.setdefault("images", []).append(norm_img(img))
             return "photo"
     if send_text(build_post(item, title_fa, sum_fa, 3900)):
         return "text"
@@ -1133,17 +1233,24 @@ def main():
     # other posts' translation retries/sleeps have eaten into it
     todo = chosen[:MAX_POSTS]
     todo.sort(key=lambda x: 0 if (x.get("video") or x.get("page_video")) else 1)
+    if not DRY_RUN:
+        refresh_seen(state)          # catch anything a concurrent/overlapping run already posted
     posted, videos = 0, 0
     for i, it in enumerate(todo):
         if left() < 25:
             log("time budget reached")
             break
+        if not DRY_RUN and i > 0:
+            refresh_seen(state)      # re-check right before each post, not just once at the top
+        if it["link"] in state["urls"] or any(similar(it["tk"], set(t)) for t in state["titles"]):
+            log("skipping, already posted (concurrent run caught it first): %s" % it["title"][:80])
+            continue
         try:
             allow_video = ENABLE_VIDEO and videos < MAX_VIDEOS and left() > 200
             if (it.get("video") or it.get("page_video")) and not allow_video:
                 log("video item won't get subtitles this run (enabled=%s, videos_used=%d, time_left=%ds)"
                     % (ENABLE_VIDEO, videos, left()))
-            res = post_item(it, allow_video)
+            res = post_item(it, allow_video, state)
         except Exception:                                        # noqa
             log("post failed:\n" + traceback.format_exc()[-600:])
             res = False
