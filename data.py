@@ -27,12 +27,22 @@ SOURCES = """
 12|B|NPR|ان‌پی‌آر|https://feeds.npr.org/1004/rss.xml
 13|B|Sky News|اسکای‌نیوز|https://feeds.skynews.com/feeds/rss/world.xml
 14|B|Politico|پولیتیکو|https://rss.politico.com/politics-news.xml https://rss.politico.com/defense.xml
-15|C|Al Jazeera English|الجزیره انگلیسی|https://www.aljazeera.com/xml/rss/all.xml
-16|C|France 24|فرانس ۲۴|https://www.france24.com/en/middle-east/rss https://www.france24.com/en/rss
-17|C|Deutsche Welle|دویچه‌وله|https://rss.dw.com/xml/rss-en-all https://rss.dw.com/xml/rss-en-world
-18|C|Euronews|یورونیوز|https://www.euronews.com/rss?format=mrss&level=theme&name=news
-19|C|Al-Monitor|المانیتور|https://www.al-monitor.com/rss
-20|C|The Times of Israel|تایمز اسرائیل|https://www.timesofisrael.com/feed/
+15|B|Newsweek|نیوزویک|https://www.newsweek.com/rss
+16|B|Foreign Policy|فارین‌پالیسی|https://foreignpolicy.com/feed/
+17|B|CBS News|سی‌بی‌اس‌نیوز|https://www.cbsnews.com/latest/rss/world https://www.cbsnews.com/latest/rss/main
+18|B|NBC News|ان‌بی‌سی‌نیوز|https://feeds.nbcnews.com/nbcnews/public/world
+19|B|Der Spiegel International|اشپیگل بین‌الملل|https://www.spiegel.de/international/index.rss
+20|C|Al Jazeera English|الجزیره انگلیسی|https://www.aljazeera.com/xml/rss/all.xml
+21|C|France 24|فرانس ۲۴|https://news.google.com/rss/search?q=site:france24.com+Iran+when:1d&hl=en-US&gl=US&ceid=US:en https://news.google.com/rss/search?q=site:france24.com+(Middle+East+OR+Israel+OR+Gulf+OR+nuclear)+when:1d&hl=en-US&gl=US&ceid=US:en
+22|C|Deutsche Welle|دویچه‌وله|https://rss.dw.com/xml/rss-en-all https://rss.dw.com/xml/rss-en-world
+23|C|Euronews|یورونیوز|https://www.euronews.com/rss?format=mrss&level=theme&name=news
+24|C|Al-Monitor|المانیتور|https://www.al-monitor.com/rss
+25|C|The Times of Israel|تایمز اسرائیل|https://news.google.com/rss/search?q=site:timesofisrael.com+Iran+when:1d&hl=en-US&gl=US&ceid=US:en https://news.google.com/rss/search?q=site:timesofisrael.com+(IRGC+OR+nuclear+OR+Tehran+OR+Hezbollah)+when:1d&hl=en-US&gl=US&ceid=US:en
+26|C|The Jerusalem Post|جروزالم‌پست|https://www.jpost.com/rss/rssfeedsfrontpage.aspx
+27|C|Haaretz|هاآرتص|https://news.google.com/rss/search?q=site:haaretz.com+Iran+when:1d&hl=en-US&gl=US&ceid=US:en
+28|C|Arab News|عرب‌نیوز|https://www.arabnews.com/rss.xml
+29|C|The National|د نشنال (امارات)|https://www.thenationalnews.com/rss
+30|C|Middle East Eye|میدل‌ایست‌آی|https://www.middleeasteye.net/rss
 """
 
 # ---------------------------------------------------------------------
