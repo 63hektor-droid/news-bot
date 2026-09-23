@@ -48,7 +48,8 @@ POST_GAP = int(env("POST_GAP_SEC", 90))           # spacing so posts arrive ~ ev
 MIN_SCORE = int(env("MIN_SCORE", 4))
 MAX_AGE_H = float(env("MAX_AGE_HOURS", 8))       # kept for reference; day-filter below is authoritative
 TEHRAN = ZoneInfo("Asia/Tehran")
-TIME_BUDGET = int(env("TIME_BUDGET_SEC", 280))
+TIME_BUDGET = int(env("TIME_BUDGET_SEC", 540))      # video (download+whisper+burn) needs far more than 280s
+VIDEO_SCAN = int(env("VIDEO_SCAN_TOP", 8))         # how many top-ranked items get checked for a video
 ENABLE_VIDEO = env("ENABLE_VIDEO", "1") == "1"
 MAX_VIDEOS = int(env("MAX_VIDEOS_PER_RUN", 1))
 MAX_VIDEO_SEC = int(env("MAX_VIDEO_SECONDS", 180))
@@ -78,8 +79,25 @@ def left():
     return TIME_BUDGET - (time.time() - START)
 
 
+_ENT = re.compile(r"&(?:#\d+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]{1,8});")
+
+
+def _unesc(s):
+    """Decode HTML entities, even doubly-encoded ones (&amp;quot; -> &quot; -> ").
+    Only real 'name;' entities are touched, so URLs like ?a=1&region=2 stay intact."""
+    s = s or ""
+    for _ in range(3):
+        n = _ENT.sub(lambda m: html.unescape(m.group(0)), s)
+        if n == s:
+            break
+        s = n
+    return s
+
+
 def esc(s):
-    return html.escape(s or "", quote=False)
+    # decode first so an entity that slipped through a translator is never
+    # escaped a second time (that is what printed a literal "&quot;")
+    return html.escape(_unesc(s), quote=False)
 
 
 def esca(s):
@@ -226,8 +244,8 @@ def similar(a, b):
 #  Fetching feeds
 # =====================================================================
 def clean_text(s):
-    s = re.sub(r"<[^>]+>", " ", s or "")
-    s = html.unescape(s)
+    s = _unesc(s or "")
+    s = re.sub(r"</?[A-Za-z][^>]*>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"(The post .{0,200} appeared first on .{0,80}\.?)$", "", s).strip()
     # some feeds (WordPress-based excerpts: DW, Euronews, Al-Monitor, etc.) append a
@@ -243,6 +261,36 @@ def clean_text(s):
     ).strip()
     s = re.sub(r"\s*[\[\(]\s*…\s*[\]\)]\s*$|\s*…\s*$", "", s).strip()
     return s
+
+
+_ABBR = re.compile(
+    r"\b(?:U\.S|U\.K|U\.N|E\.U|Mr|Mrs|Ms|Dr|Prof|St|Gen|Sen|Rep|Lt|Col|Sgt|Gov|Pres|Jr|Sr|vs|etc|Inc|Ltd|Co|Corp|Mt|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec|a\.m|p\.m)\.")
+
+
+def split_sentences(text):
+    """Sentence splitter that does not break on U.S. / Mr. / initials."""
+    t = _ABBR.sub(lambda m: m.group(0)[:-1] + "\u0001", text or "")
+    t = re.sub(r"\b([A-Z])\.(?=\s+[A-Z])", "\\1\u0001", t)
+    t = re.sub(r'([.!?]+["\u201d\u2019)\]]*)\s+(?=["\u201c\u2018(\[]?[A-Z0-9])', "\\1\u0002", t)
+    out = [p.replace("\u0001", ".").strip() for p in t.split("\u0002")]
+    return [p for p in out if p]
+
+
+def trim_complete(s, maxlen=900):
+    """Keep WHOLE sentences only. RSS excerpts are often cut mid-sentence
+    ("... said that the"); translating such a fragment gives Persian with no
+    verb (the verb comes last in Persian), so the unfinished tail is dropped."""
+    out = ""
+    for x in split_sentences(s):
+        cand = (out + " " + x).strip()
+        if len(cand) > maxlen:
+            break
+        out = cand
+    if out and not re.search(r'[.!?]["\u201d\u2019)\]]*$', out):
+        parts = split_sentences(out)
+        out = " ".join(parts[:-1]) if len(parts) > 1 else ""
+    return out
 
 
 def entry_media(e):
@@ -335,7 +383,7 @@ def fetch_feed(src, url):
             continue
         img, vid = entry_media(e)
         page_video = bool(re.search(r"/videos?/|/video-|/watch", link)) and not gnews
-        out.append(dict(title=title, summary=summ[:900], link=link, time=t, src=src["name"],
+        out.append(dict(title=title, summary=trim_complete(summ, 900), link=link, time=t, src=src["name"],
                         src_fa=src["fa"], tier=src["tier"], rank=src["rank"],
                         img=img, video=vid, page_video=page_video))
     return out
@@ -531,10 +579,10 @@ def _gt(text):
     import random
     last = None
     # 0) Google - free, no key; by far the most fluent Persian output of the
-    #    free options, so it's the default choice whenever it's reachable.
-    for i in range(2):
+    #    free options, so it gets the most retries before anything weaker.
+    for i in range(3):
         try:
-            time.sleep(1.5 + random.uniform(0, 1.5))
+            time.sleep(0.6 + random.uniform(0, 0.8))
             out = GoogleTranslator(source="auto", target="fa").translate(text)
             if _looks_translated(out):
                 return out
@@ -543,48 +591,41 @@ def _gt(text):
             break
         except Exception as ex:                                  # noqa
             last = ex
-            log("Google failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
-            # 429s from the free endpoint need a longer, exponential backoff,
-            # especially on shared CI IPs (GitHub Actions runners) that get
-            # rate-limited fast; short sleeps just burn through retries.
-            is_429 = "429" in str(ex) or "too many requests" in str(ex).lower()
-            base = 15 if is_429 else 5
-            time.sleep(base * (2 ** i) + random.uniform(0, 3))
-    # 1) MyMemory - second online option, has a raised daily quota via TRANSLATE_EMAIL.
-    #    deep_translator's MyMemoryTranslator needs locale-style codes
-    #    (e.g. "en-GB", "fa-IR"), not bare "en"/"fa" - that's what was
-    #    causing "No support for the provided language" on every attempt.
-    for i in range(3):
-        try:
-            time.sleep(2.5 + random.uniform(0, 1.5))
-            kwargs = dict(source="en-GB", target="fa-IR")
-            if TRANSLATE_EMAIL:
-                kwargs["email"] = TRANSLATE_EMAIL
-            out = MyMemoryTranslator(**kwargs).translate(text)
-            if _looks_translated(out):
-                return out
-            last = RuntimeError("MyMemory returned non-Persian/unchanged text")
-            log("MyMemory output failed the Persian-content check, trying next engine")
-            break
-        except Exception as ex:                                  # noqa
-            last = ex
-            log("MyMemory failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
-            time.sleep(3 + 3 * i + random.uniform(0, 2))
-    # 2) LibreTranslate - different infra than Google/MyMemory, still a
-    #    real neural MT engine so noticeably more fluent than the offline
-    #    fallback below; tried before Argos for that reason.
+            log("Google failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
+            if i < 2:
+                is_429 = "429" in str(ex) or "too many requests" in str(ex).lower()
+                base = 15 if is_429 else 4
+                time.sleep(base * (2 ** i) + random.uniform(0, 3))
+    # 1) LibreTranslate - a real neural engine on different infrastructure.
     try:
         out = _libre(text)
         if _looks_translated(out):
             return out
         last = RuntimeError("LibreTranslate returned non-Persian/unchanged text")
-        log("LibreTranslate output failed the Persian-content check, falling back to Argos")
+        log("LibreTranslate output failed the Persian-content check, trying next engine")
     except Exception as ex:                                      # noqa
         last = ex
-        log("LibreTranslate failed too: %s" % str(ex)[:200])
-    # 3) Argos Translate - offline, free, no key, no rate limit. Lowest
-    #    fluency of the four, so it's the true last resort, used only when
-    #    every online option above is unreachable or unusable.
+        log("LibreTranslate failed: %s" % str(ex)[:200])
+    # 2) MyMemory - translation-memory based, often returns partial/odd
+    #    sentences, so it is only used after the two engines above. It also
+    #    refuses inputs over 500 chars.
+    if len(text) <= 480:
+        for i in range(2):
+            try:
+                time.sleep(2 + random.uniform(0, 1.5))
+                kwargs = dict(source="en-GB", target="fa-IR")
+                if TRANSLATE_EMAIL:
+                    kwargs["email"] = TRANSLATE_EMAIL
+                out = MyMemoryTranslator(**kwargs).translate(text)
+                if _looks_translated(out):
+                    return out
+                last = RuntimeError("MyMemory returned non-Persian/unchanged text")
+                break
+            except Exception as ex:                              # noqa
+                last = ex
+                log("MyMemory failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
+                time.sleep(3 + random.uniform(0, 2))
+    # 3) Argos Translate - offline, lowest fluency: true last resort.
     try:
         return _argos(text)
     except Exception as ex:                                      # noqa
@@ -596,6 +637,7 @@ _FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 
 def fix_fa(s):
+    s = _unesc(s)                      # &quot; / &#39; some translators return -> real characters
     s = s.replace("ي", "ی").replace("ك", "ک")
     # Persian punctuation marks instead of the Latin ones free translators
     # often leave behind (real "رعایت نگارش فارسی" issue, not cosmetic)
@@ -634,12 +676,30 @@ def fix_fa(s):
     return s.strip()
 
 
-def translate(text, translator=None):
-    """English (any language) -> fluent-as-possible Persian, with glossary."""
+def _chunks(text, maxlen=280):
+    """Group whole sentences into pieces of at most ~maxlen chars. Translating
+    sentence-sized pieces (instead of one long blob) stops the free engines
+    from dropping clauses - and with them the verb."""
+    out, cur = [], ""
+    for s in split_sentences(text):
+        if cur and len(cur) + 1 + len(s) > maxlen:
+            out.append(cur)
+            cur = s
+        else:
+            cur = (cur + " " + s).strip()
+    if cur:
+        out.append(cur)
+    return out or [text]
+
+
+def _too_short(src, out):
+    n = len(re.findall(r"[A-Za-z0-9']+", src))
+    m = len(out.split())
+    return n >= 8 and m < 0.4 * n
+
+
+def _translate_chunk(text, translator=None):
     translator = translator or _gt
-    text = clean_text(text)
-    if not text:
-        return ""
     mapping, protected = {}, text
     for rx, fa in GLOSS:
         def sub(m, fa=fa):
@@ -648,6 +708,7 @@ def translate(text, translator=None):
             mapping[k] = fa
             return tok
         protected = rx.sub(sub, protected)
+    res = None
     if mapping:
         out = translator(protected)
         found = set()
@@ -656,11 +717,30 @@ def translate(text, translator=None):
             k = int(m.group(1).translate(_DIG))
             found.add(k)
             return mapping.get(k, "")
-        res = re.sub(r"Z\s?Q\s?([0-9۰-۹]+)\s?Q\s?Z", back, out, flags=re.I)
-        if len(found) == len(mapping):
-            return fix_fa(res)
-        log("glossary tokens lost, retrying without glossary")
-    return fix_fa(translator(text))
+        res = re.sub(r"Z\s?Q\s?([0-9\u06f0-\u06f9]+)\s?Q\s?Z", back, out, flags=re.I)
+        if len(found) != len(mapping):
+            log("glossary tokens lost, retrying without glossary")
+            res = None
+    if res is None:
+        res = translator(text)
+    elif _too_short(text, res):
+        # the placeholders can make an engine give up on the rest of the
+        # sentence; if the result is suspiciously short, compare with a
+        # plain translation and keep the fuller one
+        log("translation looks truncated, retrying without glossary")
+        alt = translator(text)
+        if len(alt.split()) > len(res.split()):
+            res = alt
+    return res
+
+
+def translate(text, translator=None):
+    """English (any language) -> fluent-as-possible Persian, with glossary."""
+    text = clean_text(text)
+    if not text:
+        return ""
+    outs = [_translate_chunk(ch, translator) for ch in _chunks(text)]
+    return fix_fa(" ".join(o.strip() for o in outs if o and o.strip()))
 
 
 # =====================================================================
@@ -709,14 +789,17 @@ def build_post(item, title_fa, sum_fa, limit):
         lines.append(RLM + tags)
         return "\n".join(lines)
 
-    s, t = sum_fa, title_fa
+    s, t = (sum_fa or "").strip(), title_fa
+    if s and s[-1] not in ".!؟?…»\")":
+        s += "."
     guard = 0
     while visible_len(assemble(t, s)) > limit and guard < 40:
         guard += 1
         if s:
-            cut = int(len(s) * 0.8)
-            cut_at = max(s.rfind(" ", 0, cut), s.rfind(".", 0, cut), 0)
-            s = (s[:cut_at].rstrip(" ،.") + "…") if cut_at > 40 else ""
+            # drop whole sentences from the end - never cut in the middle of
+            # one (a Persian sentence cut mid-way loses its verb)
+            parts = re.split(r"(?<=[.!؟?])\s+", s)
+            s = " ".join(parts[:-1]) if len(parts) > 1 else ""
         else:
             t = t[:int(len(t) * 0.85)].rstrip() + "…"
     return assemble(t, s)
@@ -793,35 +876,95 @@ def img_ok(url):
         return False
 
 
+_IMG_NOISE = {"w", "h", "width", "height", "quality", "q", "fit", "crop", "auto", "format", "fm", "fmt",
+              "dpr", "resize", "size", "ts", "v", "t", "cb", "strip", "ssl", "compress"}
+FPCACHE = {}
+
+
 def norm_img(url):
-    """Netloc + path only (no query string) - enough to catch the same
-    picture being handed out again with a different cache-busting query
-    string, without needing to download and hash the bytes."""
+    """Netloc + path + the query parameters that actually identify the picture
+    (size/quality/cache-buster parameters are ignored)."""
     try:
         p = urlsplit(url)
-        return (p.netloc.lower() + p.path).rstrip("/")
+        q = sorted((k, v) for k, v in parse_qsl(p.query) if k.lower() not in _IMG_NOISE)
+        return (p.netloc.lower() + p.path + ("?" + urlencode(q) if q else "")).rstrip("/")
     except Exception:                                              # noqa
         return url
 
 
-def image_candidates(item, used_images):
+def img_fp(url):
+    """Content fingerprint of a picture: (sha1 of the bytes, 64-bit dHash).
+    The same photo served under different URLs/sizes gets the same/similar
+    fingerprint, which the URL comparison alone could never catch."""
+    try:
+        import requests
+        import hashlib
+        import io
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=12, stream=True)
+        try:
+            if r.status_code != 200:
+                return None
+            b = r.raw.read(4000000, decode_content=True)
+        finally:
+            r.close()
+        if not b:
+            return None
+        sha = hashlib.sha1(b).hexdigest()
+        dh = None
+        try:
+            from PIL import Image, ImageFile
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
+            px = list(Image.open(io.BytesIO(b)).convert("L").resize((9, 8)).getdata())
+            dh = 0
+            for row in range(8):
+                for col in range(8):
+                    dh = (dh << 1) | (1 if px[row * 9 + col] > px[row * 9 + col + 1] else 0)
+        except Exception:                                          # noqa
+            dh = None
+        return sha, dh
+    except Exception:                                              # noqa
+        return None
+
+
+def img_is_dup(fp, state):
+    sha, dh = fp
+    for old in state.get("img_fp", []):
+        try:
+            osha, odh = old
+        except Exception:                                          # noqa
+            continue
+        if osha == sha:
+            return True
+        if dh is not None and odh is not None and bin(dh ^ odh).count("1") <= 3:
+            return True
+    return False
+
+
+def image_candidates(item, state):
     """Yield validated image URLs for this specific item, best first: the
-    RSS-supplied image (fast, already item-specific) then, if that fails
-    validation, the og:image scraped straight from this item's own article
-    page (skipped for Google News redirect links, which aren't real
-    article pages). Anything already used for an earlier, different story
-    is skipped - some sites fall back to one generic "featured image" (a
-    section banner, a live-blog cover, ...) for articles that don't have
-    their own photo, and that generic image isn't always caught by the
-    logo/icon filter in img_ok(), so several unrelated stories were being
-    posted with the same picture."""
-    seen = {norm_img(u) for u in used_images}
+    RSS-supplied image, then the og:image of the item's own article page.
+    A candidate is skipped when (a) its URL was used before, (b) it is
+    unreachable/too small/a logo, or (c) its CONTENT matches a picture already
+    posted for another story (same photo under a different URL)."""
+    seen = {norm_img(u) for u in state.get("images", [])}
+
+    def usable(u):
+        if not u or norm_img(u) in seen or not img_ok(u):
+            return False
+        fp = img_fp(u)
+        if fp is not None:
+            if img_is_dup(fp, state):
+                log("skipping image, same picture already used for another story:", u[:90])
+                return False
+            FPCACHE[u] = fp
+        return True
+
     rss_img = item.get("img")
-    if rss_img and norm_img(rss_img) not in seen and img_ok(rss_img):
+    if usable(rss_img):
         yield rss_img
     if "news.google.com" not in item["link"]:
         scraped = og_image(item["link"])
-        if scraped and scraped != rss_img and norm_img(scraped) not in seen and img_ok(scraped):
+        if scraped and scraped != rss_img and usable(scraped):
             yield scraped
 
 
@@ -859,6 +1002,51 @@ def run(cmd, timeout):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+def ensure_python_deps():
+    """Install yt-dlp / faster-whisper on the fly when the workflow does not
+    provide them, so replacing bot.py alone is enough."""
+    if not ENABLE_VIDEO:
+        return
+    for mod, pkg in (("yt_dlp", "yt-dlp"), ("faster_whisper", "faster-whisper")):
+        try:
+            __import__(mod)
+            continue
+        except Exception:                                        # noqa
+            pass
+        log("installing missing python package:", pkg)
+        for extra in ([], ["--break-system-packages"]):
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg] + extra,
+                                   capture_output=True, text=True, timeout=240)
+                if r.returncode == 0:
+                    import importlib
+                    importlib.invalidate_caches()
+                    break
+                log("pip install %s failed: %s" % (pkg, r.stderr[-200:]))
+            except Exception as ex:                              # noqa
+                log("pip install %s error: %s" % (pkg, str(ex)[:150]))
+                break
+
+
+def video_preflight():
+    """One log line that tells at a glance why videos are (not) working."""
+    ensure_python_deps()
+    def has(mod):
+        try:
+            __import__(mod)
+            return True
+        except Exception:                                        # noqa
+            return False
+    log("video: enabled=%s | ffmpeg=%s | ffprobe=%s | yt_dlp=%s | faster_whisper=%s | budget=%ds"
+        % (ENABLE_VIDEO, bool(shutil.which("ffmpeg")), bool(shutil.which("ffprobe")),
+           has("yt_dlp"), has("faster_whisper"), TIME_BUDGET))
+    if ENABLE_VIDEO and not has("yt_dlp"):
+        log("WARNING: yt-dlp is not installed -> article-page videos can never be fetched "
+            "(add 'yt-dlp' to the pip install step)")
+    if ENABLE_VIDEO and not has("faster_whisper"):
+        log("WARNING: faster-whisper is not installed -> videos go out without Persian subtitles")
+
+
 def ensure_tools():
     """Returns the Persian font family to burn subtitles with, or None if
     ffmpeg or a real Persian font couldn't be made available. Falling back
@@ -893,6 +1081,10 @@ def download(url, path):
             with requests.get(url, headers={"User-Agent": UA}, stream=True, timeout=30) as r:
                 if r.status_code != 200:
                     raise RuntimeError("HTTP %d" % r.status_code)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if ct.startswith("text/") or "html" in ct or "json" in ct:
+                    log("not a video file (Content-Type %s): %s" % (ct, url[:90]))
+                    return False
                 size = 0
                 with open(path, "wb") as f:
                     for ch in r.iter_content(1 << 16):
@@ -911,36 +1103,54 @@ def ytdlp_download(url, tmp):
     try:
         import yt_dlp
     except Exception:                                            # noqa
+        log("ERROR: yt-dlp is NOT installed - videos embedded in article pages can never be fetched. "
+            "Add 'yt-dlp' to the pip install step of the workflow.")
         return None
-    out = os.path.join(tmp, "yt.%(ext)s")
-    opts = {"outtmpl": out, "quiet": True, "no_warnings": True, "noplaylist": True,
+    sub = tempfile.mkdtemp(dir=tmp)
+    opts = {"outtmpl": os.path.join(sub, "yt.%(ext)s"), "quiet": True, "no_warnings": True, "noplaylist": True,
             "socket_timeout": 20, "retries": 3, "max_filesize": MAX_VIDEO_MB * 1024 * 1024,
-            "format": "best[ext=mp4][height<=720]/best[height<=720]/best",
-            "match_filter": yt_dlp.utils.match_filter_func("duration <= %d" % MAX_VIDEO_SEC)}
+            "format": "b[ext=mp4][height<=720]/bv*[height<=720]+ba/b[height<=720]/b",
+            "merge_output_format": "mp4",
+            "http_headers": {"User-Agent": UA},
+            # "<=?" = also accept when the site does not report a duration
+            "match_filter": yt_dlp.utils.match_filter_func("duration <=? %d & !is_live" % MAX_VIDEO_SEC)}
+    cookies = env("YT_COOKIES", "")            # optional secret: Netscape-format cookies.txt content
+    if cookies:
+        cpath = os.path.join(tmp, "cookies.txt")
+        with open(cpath, "w", encoding="utf-8") as f:
+            f.write(cookies)
+        opts["cookiefile"] = cpath
     try:
         with yt_dlp.YoutubeDL(opts) as y:
             y.download([url])
     except Exception as ex:                                      # noqa
-        log("yt-dlp failed:", str(ex)[:120])
+        log("yt-dlp failed for %s: %s" % (url[:80], str(ex)[:300]))
         return None
-    for f in os.listdir(tmp):
-        if f.startswith("yt."):
-            return os.path.join(tmp, f)
-    return None
+    files = [os.path.join(sub, f) for f in os.listdir(sub)
+             if not f.endswith((".part", ".ytdl", ".json", ".txt"))]
+    if not files:
+        log("yt-dlp finished but produced no file for", url[:80])
+        return None
+    return max(files, key=os.path.getsize)
 
 
 def probe(path):
     r = run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path], 40)
-    j = json.loads(r.stdout or "{}")
+    try:
+        j = json.loads(r.stdout or "{}")
+    except Exception:                                            # noqa
+        j = {}
     w = h = 0
     has_audio = False
+    vcodec = ""
     for s in j.get("streams", []):
         if s.get("codec_type") == "video" and not w:
-            w, h = int(s.get("width", 0)), int(s.get("height", 0))
+            w, h = int(s.get("width", 0) or 0), int(s.get("height", 0) or 0)
+            vcodec = s.get("codec_name", "")
         if s.get("codec_type") == "audio":
             has_audio = True
     dur = float(j.get("format", {}).get("duration", 0) or 0)
-    return w, h, dur, has_audio
+    return w, h, dur, has_audio, vcodec
 
 
 def ass_time(t):
@@ -980,62 +1190,122 @@ def build_ass(segs, w, h, font, path):
         f.write(head + "\n".join(lines) + "\n")
 
 
-def detect_page_video(link):
-    """RSS entries rarely carry a video enclosure, and most video-led
-    articles (Guardian, DW, ...) don't have '/video/' or '/watch' in their
-    URL either - they just embed a YouTube/Vimeo/Brightcove/JW player in
-    the page with JS. That combination meant page_video was almost never
-    True, so the video pipeline was never even attempted for these. Fetch
-    the article page itself and look for real embed signals; yt-dlp's
-    generic extractor can pull the video out of the link once we know one
-    is actually there. Only called for the few items about to be posted,
-    not for every RSS entry, so the extra request is cheap."""
+def find_video_urls(link):
+    """Look inside the article page for real video sources. RSS entries almost
+    never carry a video enclosure and most video-led articles have no
+    '/video/' in the URL; they embed a player. Returns candidate URLs (best
+    first) for download()/yt-dlp; [] when the page has no video."""
     try:
         import requests
         r = requests.get(link, headers={"User-Agent": UA}, timeout=15)
         if r.status_code != 200:
-            return False
-        body = r.text[:400000].lower()
+            return []
+        body = r.text[:600000]
     except Exception as ex:                                      # noqa
         log("page fetch for video-detect failed:", str(ex)[:100])
-        return False
-    signals = (
-        "og:video", '"videoobject"', "youtube.com/embed", "youtube-nocookie.com/embed",
-        "player.vimeo.com", "brightcove", "jwplayer", "<video",
-    )
-    return any(s in body for s in signals)
+        return []
+    found = []
+
+    def add(u):
+        u = html.unescape((u or "").strip())
+        if u.startswith("//"):
+            u = "https:" + u
+        if u.startswith("http") and u not in found:
+            found.append(u)
+    for pat in (r'<meta[^>]+(?:property|name)=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:video(?::secure_url|:url)?["\']',
+                r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)'):
+        for m in re.finditer(pat, body, re.I):
+            add(m.group(1))
+    for m in re.finditer(r'<(?:video|source)[^>]+src=["\']([^"\']+\.(?:mp4|m4v|mov|webm|m3u8)[^"\']*)', body, re.I):
+        add(m.group(1))
+    for m in re.finditer(r'youtube(?:-nocookie)?\.com/embed/([\w-]{11})', body, re.I):
+        add("https://www.youtube.com/watch?v=" + m.group(1))
+    for m in re.finditer(r'player\.vimeo\.com/video/(\d+)', body, re.I):
+        add("https://vimeo.com/" + m.group(1))
+    low = body.lower()
+    if any(sg in low for sg in ("brightcove", "jwplayer", "<video", '"videoobject"')):
+        add(link)                    # let yt-dlp's generic extractor try the page itself
+    return found[:4]
+
+
+def _scan_video(item):
+    urls = find_video_urls(item["link"])
+    if urls:
+        item["vurls"] = urls
+        item["page_video"] = True
+
+
+def fetch_video_source(item, tmp):
+    """Try each candidate until one is a real, playable, short-enough video.
+    Returns (path, (w, h, dur, has_audio, vcodec)) or None."""
+    cands = []
+    for u in [item.get("video")] + list(item.get("vurls") or []):
+        if u and u not in cands:
+            cands.append(u)
+    if item.get("page_video") and item["link"] not in cands:
+        cands.append(item["link"])
+    for n, u in enumerate(cands[:4]):
+        p = None
+        m = re.search(r"\.(mp4|m4v|mov|webm)(?:\?|$)", u, re.I)
+        if m or u == item.get("video"):
+            ext = m.group(1).lower() if m else "mp4"
+            p = os.path.join(tmp, "dl%d.%s" % (n, ext))
+            if not download(u, p):
+                p = None
+        if not p and not m:
+            p = ytdlp_download(u, tmp)
+        if not p:
+            continue
+        info = probe(p)
+        w, h, dur = info[0], info[1], info[2]
+        if not w or not h or dur <= 0:
+            log("candidate is not a playable video:", u[:90])
+            continue
+        if dur > MAX_VIDEO_SEC + 5:
+            log("video too long (%ds > %ds): %s" % (dur, MAX_VIDEO_SEC, u[:90]))
+            continue
+        return p, info
+    return None
+
+
+def _ensure_mp4(tmp, src, vcodec):
+    """Telegram plays mp4/h264/aac (<50MB) reliably. Re-encode anything else
+    (webm, hevc, av1, ...) or anything too large. None if that is impossible."""
+    limit = 49 * 1024 * 1024
+    if src.lower().endswith(".mp4") and vcodec == "h264" and os.path.getsize(src) < limit:
+        return src
+    outp = os.path.join(tmp, "norm.mp4")
+    for crf in ("28", "33"):
+        r = subprocess.run(["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", crf,
+                            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", outp],
+                           capture_output=True, text=True, timeout=max(60, int(left() - 20)))
+        if r.returncode == 0 and os.path.exists(outp) and os.path.getsize(outp) < limit:
+            return outp
+        log("re-encode failed or too big (crf %s): %s" % (crf, r.stderr[-200:]))
+    return None
 
 
 def make_video(item, tmp):
     """Returns (path, w, h, dur, subtitled) or None."""
-    src = os.path.join(tmp, "in.mp4")
-    if item.get("video"):
-        if not download(item["video"], src):
-            return None
-    elif item.get("page_video"):
-        p = ytdlp_download(item["link"], tmp)
-        if not p:
-            return None
-        src = p
-    else:
-        return None
-    # ensure_tools() installs ffmpeg (which provides ffprobe) as a side
-    # effect - it has to run before probe() below, not after. probe() was
-    # being called first, so on any runner image that doesn't already have
-    # ffmpeg preinstalled, ffprobe was simply missing and every single
-    # video died right here with no post ever going out - this is very
-    # likely why no video has ever landed in the channel.
+    # ffmpeg/ffprobe must exist BEFORE anything is probed or merged
     font = ensure_tools()
-    if not shutil.which("ffmpeg"):
-        log("no ffmpeg available even after install attempt - cannot post this video")
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        log("no ffmpeg/ffprobe available even after install attempt - cannot post this video")
         return None
-    w, h, dur, has_audio = probe(src)
-    if not w or not h or dur <= 0 or dur > MAX_VIDEO_SEC + 5:
-        log("video rejected (size/duration):", w, h, dur)
+    got = fetch_video_source(item, tmp)
+    if not got:
+        log("no playable video could be fetched for:", item["link"][:90])
         return None
+    src, (w, h, dur, has_audio, vcodec) = got
+    log("video fetched: %dx%d %.0fs codec=%s audio=%s" % (w, h, dur, vcodec, has_audio))
+
+    def plain():
+        base = _ensure_mp4(tmp, src, vcodec)
+        return (base, w, h, dur, False) if base else None
     if not font:
         log("skipping subtitles for this video: no Persian font available")
-        return src, w, h, dur, False
+        return plain()
     segs = []
     if has_audio and left() > 120:
         wav = os.path.join(tmp, "a.wav")
@@ -1052,16 +1322,11 @@ def make_video(item, tmp):
                     if len(tx) < 2:
                         continue
                     raw.append((s.start, s.end, tx))
-                # merge short/fragmented segments into fuller phrases before
-                # translating each one - translating single disjointed
-                # fragments in isolation (e.g. "and then", "the president")
-                # produced choppy, incoherent subtitles; giving the
-                # translator a fuller phrase for context makes each line
-                # noticeably more fluent. Only merges across small gaps, so
-                # it doesn't glue together unrelated sentences after a pause.
+                # merge short fragments into fuller phrases before translating
+                # (isolated fragments translate into choppy, verbless subtitles)
                 groups = []
                 for start, end, tx in raw:
-                    if (groups and len(groups[-1][2]) < 40
+                    if (groups and len(groups[-1][2]) < 60
                             and start - groups[-1][1] < 1.2):
                         gs, ge, gt = groups[-1]
                         groups[-1] = (gs, end, (gt + " " + tx).strip())
@@ -1077,7 +1342,7 @@ def make_video(item, tmp):
             log("whisper failed:", str(ex)[:200])
             segs = []
     if not segs:
-        return src, w, h, dur, False
+        return plain()
     ass = os.path.join(tmp, "sub.ass")
     build_ass(segs, w, h, font, ass)
     outp = os.path.join(tmp, "out.mp4")
@@ -1085,14 +1350,14 @@ def make_video(item, tmp):
         if _burn(tmp, src, crf) and os.path.exists(outp) and os.path.getsize(outp) < 49 * 1024 * 1024:
             return outp, w, h, dur, True
     log("burn-in failed, sending original video")
-    return src, w, h, dur, False
+    return plain()
 
 
 def _burn(tmp, src, crf):
-    name = os.path.basename(src)
+    name = os.path.relpath(src, tmp)
     try:
         r = subprocess.run(["ffmpeg", "-y", "-i", name, "-vf", "ass=sub.ass", "-c:v", "libx264",
-                            "-preset", "veryfast", "-crf", crf, "-c:a", "aac", "-b:a", "96k",
+                            "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
                             "-movflags", "+faststart", "out.mp4"],
                            cwd=tmp, capture_output=True, text=True, timeout=max(60, int(left() - 20)))
         if r.returncode != 0:
@@ -1113,15 +1378,17 @@ def load_state():
         s.setdefault("urls", [])
         s.setdefault("titles", [])
         s.setdefault("images", [])
+        s.setdefault("img_fp", [])
         return s
     except Exception:                                            # noqa
-        return {"urls": [], "titles": [], "images": []}
+        return {"urls": [], "titles": [], "images": [], "img_fp": []}
 
 
 def save_state(s):
     s["urls"] = s["urls"][-4000:]
     s["titles"] = s["titles"][-500:]
     s["images"] = s.get("images", [])[-500:]
+    s["img_fp"] = s.get("img_fp", [])[-500:]
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False)
@@ -1153,6 +1420,9 @@ def refresh_seen(state):
     for im in fresh.get("images", []):
         if im not in state.get("images", []):
             state.setdefault("images", []).append(im)
+    for fp in fresh.get("img_fp", []):
+        if fp not in state.setdefault("img_fp", []):
+            state["img_fp"].append(fp)
 
 
 def git_push_state(state):
@@ -1196,8 +1466,9 @@ def post_item(item, allow_video, state):
         return True
 
     if allow_video and ENABLE_VIDEO and not (item.get("video") or item.get("page_video")):
-        if detect_page_video(item["link"]):
-            item["page_video"] = True
+        urls = find_video_urls(item["link"])
+        if urls:
+            item["vurls"], item["page_video"] = urls, True
             log("video detected on article page (not in RSS/URL):", item["link"][:90])
 
     if allow_video and ENABLE_VIDEO and (item.get("video") or item.get("page_video")):
@@ -1211,14 +1482,19 @@ def post_item(item, allow_video, state):
                     cap = cap.replace(RLM + "🔗", RLM + "🎬 زیرنویس فارسی خودکار\n" + RLM + "🔗", 1)
                 if send_video(path, cap, w, h, dur):
                     return "video"
+                log("sending the video to Telegram failed, falling back to photo/text")
+            else:
+                log("video pipeline produced nothing, falling back to photo/text")
         except Exception as ex:                                  # noqa
             log("video pipeline failed:", str(ex)[:200])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    for img in image_candidates(item, state.get("images", [])):
+    for img in image_candidates(item, state):
         if send_photo(img, build_post(item, title_fa, sum_fa, 1000)):
             state.setdefault("images", []).append(norm_img(img))
+            if FPCACHE.get(img):
+                state.setdefault("img_fp", []).append(list(FPCACHE[img]))
             return "photo"
     if send_text(build_post(item, title_fa, sum_fa, 3900)):
         return "text"
@@ -1237,6 +1513,7 @@ def main():
     build_terms()
     sources = load_sources()
     log("terms: %d | glossary: %d | sources: %d" % (len(TERMS), len(GLOSS), len(sources)))
+    video_preflight()
 
     state = load_state()
     items, health = fetch_all(sources)
@@ -1254,6 +1531,21 @@ def main():
     # gets the full time budget, instead of whatever's left after the
     # other posts' translation retries/sleeps have eaten into it
     todo = chosen[:MAX_POSTS]
+    if ENABLE_VIDEO and MAX_VIDEOS > 0 and chosen:
+        scan = [c for c in chosen[:VIDEO_SCAN] if not c.get("video") and not c.get("page_video")
+                and "news.google.com" not in c["link"]]
+        if scan:
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                list(ex.map(_scan_video, scan))
+        vids = [c for c in chosen[:VIDEO_SCAN] if c.get("video") or c.get("page_video")]
+        log("video candidates among the top %d items: %d" % (min(VIDEO_SCAN, len(chosen)), len(vids)))
+        # if none of today's posts has a video but a slightly lower-ranked item
+        # does, let it take the last slot so videos actually reach the channel
+        if vids and not any(v is t for v in vids for t in todo):
+            if len(todo) >= MAX_POSTS:
+                todo[-1] = vids[0]
+            else:
+                todo.append(vids[0])
     todo.sort(key=lambda x: 0 if (x.get("video") or x.get("page_video")) else 1)
     if not DRY_RUN:
         refresh_seen(state)          # catch anything a concurrent/overlapping run already posted
@@ -1268,7 +1560,7 @@ def main():
             log("skipping, already posted (concurrent run caught it first): %s" % it["title"][:80])
             continue
         try:
-            allow_video = ENABLE_VIDEO and videos < MAX_VIDEOS and left() > 200
+            allow_video = ENABLE_VIDEO and videos < MAX_VIDEOS and left() > 150
             if (it.get("video") or it.get("page_video")) and not allow_video:
                 log("video item won't get subtitles this run (enabled=%s, videos_used=%d, time_left=%ds)"
                     % (ENABLE_VIDEO, videos, left()))
@@ -1344,6 +1636,17 @@ def selftest():
     build_ass([(0.0, 2.5, "این یک زیرنویس آزمایشی است که باید در چند خط شکسته شود")], 1280, 720,
               "Vazirmatn", os.path.join(d, "s.ass"))
     assert "Dialogue" in open(os.path.join(d, "s.ass"), encoding="utf-8").read()
+    # entities must never reach the channel, even doubly encoded
+    assert "&" not in fix_fa("&quot;test&quot; and &amp;quot;x&amp;quot; &#39;y&#39;")
+    assert esc("&amp;quot;a&amp;quot;") == '"a"'
+    assert esc("a & b < c") == "a &amp; b &lt; c"
+    # summaries are cut on sentence boundaries only
+    assert trim_complete("Trump spoke at the U.S. Mission. He then said that the", 900) == "Trump spoke at the U.S. Mission."
+    assert trim_complete("He said that the", 900) == ""
+    assert build_post(it, "عنوان", "جمله اول است. جمله دوم " + "بلند " * 300 + ".", 400).count("بلند") == 0
+    # same photo under a different URL is caught by content
+    st = {"img_fp": [["abc", 0b1011]]}
+    assert img_is_dup(("abc", None), st) and img_is_dup(("zzz", 0b1010), st) and not img_is_dup(("zzz", (1 << 60) | 5), st)
     log("selftest finished, failures: %d" % bad)
     sys.exit(1 if bad else 0)
 
