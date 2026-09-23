@@ -332,22 +332,34 @@ def select(items, state):
     now = datetime.now(timezone.utc)
     today_ir = now.astimezone(TEHRAN).date()
     pool = []
+    n_seen = n_future = n_notoday = 0
+    near_misses = []   # (pts, strong, medium, title) for items that scored but didn't pass
     for it in items:
         if it["link"] in seen:
+            n_seen += 1
             continue
         age = (now - it["time"]).total_seconds() / 3600.0
         if age < -1:                                   # clock-skew / future timestamp
+            n_future += 1
             continue
         if it["time"].astimezone(TEHRAN).date() != today_ir:   # only today's news (Iran time)
+            n_notoday += 1
             continue
         a = analyze(it["title"], it["summary"])
         if not a["ok"]:
+            if a["pts"] > 0:
+                near_misses.append((a["pts"], a["strong"], a["medium"], it["title"]))
             continue
         fresh = 2 if age < 1 else (1 if age < 3 else 0)
         it.update(a)
         it["age"] = age
         it["total"] = a["pts"] + 2 * TIER_BONUS[it["tier"]] + fresh
         pool.append(it)
+    log("select: seen=%d future_ts=%d not_today=%d scored_candidates=%d near_misses=%d"
+        % (n_seen, n_future, n_notoday, len(items) - n_seen - n_future - n_notoday, len(near_misses)))
+    near_misses.sort(key=lambda x: -x[0])
+    for pts, strong, medium, title in near_misses[:15]:
+        log("  near-miss pts=%2d strong=%d med=%d  %s" % (pts, strong, medium, title[:90]))
     pool.sort(key=lambda x: (-x["total"], x["rank"]))
     chosen = []
     for it in pool:
