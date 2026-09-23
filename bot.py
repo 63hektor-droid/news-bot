@@ -272,6 +272,31 @@ def entry_media(e):
     return img, vid
 
 
+def resolve_gnews_link(url):
+    """Google News RSS article links are opaque, per-fetch redirect tokens - the
+    exact same story can get a different link every time the feed is polled,
+    which defeats the URL-based duplicate check in state['urls'] and was
+    letting Reuters/AP/France24/Times of Israel items (all routed through
+    Google News) get posted again verbatim. Follow the redirect once to the
+    real publisher URL, which is stable across fetches - and a better link
+    for readers than a news.google.com redirect page."""
+    import requests
+    try:
+        r = requests.head(url, headers={"User-Agent": UA}, timeout=8, allow_redirects=True)
+        if r.url and "news.google.com" not in r.url:
+            return r.url
+    except Exception:                                              # noqa
+        pass
+    try:
+        with requests.get(url, headers={"User-Agent": UA}, timeout=10,
+                           allow_redirects=True, stream=True) as r:
+            if r.url and "news.google.com" not in r.url:
+                return r.url
+    except Exception:                                              # noqa
+        pass
+    return url
+
+
 def fetch_feed(src, url):
     import requests
     import feedparser
@@ -347,9 +372,6 @@ def select(items, state):
     n_seen = n_future = n_notoday = 0
     near_misses = []   # (pts, strong, medium, title) for items that scored but didn't pass
     for it in items:
-        if it["link"] in seen:
-            n_seen += 1
-            continue
         age = (now - it["time"]).total_seconds() / 3600.0
         if age < -1:                                   # clock-skew / future timestamp
             n_future += 1
@@ -362,13 +384,20 @@ def select(items, state):
             if a["pts"] > 0:
                 near_misses.append((a["pts"], a["strong"], a["medium"], it["title"]))
             continue
+        # only resolve the (few) items that actually made it past scoring - resolving
+        # every raw item would mean hundreds of extra requests every run
+        if "news.google.com" in it["link"]:
+            it["link"] = normalize_link(resolve_gnews_link(it["link"]))
+        if it["link"] in seen:
+            n_seen += 1
+            continue
         fresh = 2 if age < 1 else (1 if age < 3 else 0)
         it.update(a)
         it["age"] = age
         it["total"] = a["pts"] + 2 * TIER_BONUS[it["tier"]] + fresh
         pool.append(it)
     log("select: seen=%d future_ts=%d not_today=%d scored_candidates=%d near_misses=%d"
-        % (n_seen, n_future, n_notoday, len(items) - n_seen - n_future - n_notoday, len(near_misses)))
+        % (n_seen, n_future, n_notoday, len(items) - n_future - n_notoday, len(near_misses)))
     near_misses.sort(key=lambda x: -x[0])
     for pts, strong, medium, title in near_misses[:15]:
         log("  near-miss pts=%2d strong=%d med=%d  %s" % (pts, strong, medium, title[:90]))
