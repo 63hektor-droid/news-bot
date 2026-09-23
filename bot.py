@@ -230,6 +230,18 @@ def clean_text(s):
     s = html.unescape(s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"(The post .{0,200} appeared first on .{0,80}\.?)$", "", s).strip()
+    # some feeds (WordPress-based excerpts: DW, Euronews, Al-Monitor, etc.) append a
+    # "Continue reading" / "Read more" link after the truncated summary; once HTML
+    # tags are stripped above, its link text is left dangling as plain text, and the
+    # translator turns it into a Persian "ادامه مطلب" that promises content that
+    # was never actually included - strip it (and any trailing "[…]" ellipsis marker)
+    s = re.sub(
+        r"\s*[\[\(]?\s*(?:continue reading|read more|read the full (?:article|story)|"
+        r"full story|click here|see more|the post continues|more\s*[»→>]{0,2})"
+        r"\s*[\]\)]?\s*[\.…]{0,3}$",
+        "", s, flags=re.I,
+    ).strip()
+    s = re.sub(r"\s*[\[\(]\s*…\s*[\]\)]\s*$|\s*…\s*$", "", s).strip()
     return s
 
 
@@ -1128,7 +1140,7 @@ def main():
 def selftest():
     build_terms()
     srcs = load_sources()
-    assert len(srcs) == 20, len(srcs)
+    assert len(srcs) == 30, len(srcs)
     log("terms loaded:", len(TERMS))
     cases = [
         ("Iran says it will resume uranium enrichment at Fordow", "", True),
