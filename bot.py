@@ -363,9 +363,31 @@ def fetch_all(sources):
 # =====================================================================
 #  Selection
 # =====================================================================
+def common_words(old, min_frac=0.12):
+    """Words that show up in a large fraction of *recently posted* titles
+    are generic to this feed's beat, not evidence of "same story" - this
+    bot only covers Iran/Israel/Gaza-region news, so words like "israel",
+    "gaza", "strike", "says" recur in nearly every headline. Matching on
+    them was treating unrelated stories that merely share the topic as
+    duplicates of each other and of weeks of accumulated history - which
+    is how a whole day's worth of genuinely new stories (30 relevant
+    items) ended up with 0 surviving de-dup in one run. Strip these out
+    before the similarity check; only words specific enough to actually
+    identify one story (names, places, unusual nouns) should count."""
+    if not old:
+        return set()
+    freq = Counter()
+    for t in old:
+        freq.update(t)
+    thresh = max(3, int(len(old) * min_frac))
+    return {w for w, n in freq.items() if n >= thresh}
+
+
 def select(items, state):
     seen = set(state["urls"])
     old = [set(t) for t in state["titles"]]
+    common = common_words(old)
+    old = [o - common for o in old]
     now = datetime.now(timezone.utc)
     today_ir = now.astimezone(TEHRAN).date()
     pool = []
@@ -404,7 +426,7 @@ def select(items, state):
     pool.sort(key=lambda x: (-x["total"], x["rank"]))
     chosen = []
     for it in pool:
-        tk = toks(it["title"])
+        tk = toks(it["title"]) - common
         it["tk"] = tk
         if any(similar(tk, o) for o in old):
             continue
