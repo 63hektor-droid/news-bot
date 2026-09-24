@@ -1332,12 +1332,32 @@ def make_video(item, tmp):
                         groups[-1] = (gs, end, (gt + " " + tx).strip())
                     else:
                         groups.append((start, end, tx))
+                # Translate EVERY phrase. The online engines (Google -> Libre ->
+                # MyMemory) can take 30-60s per phrase when rate-limited, and the
+                # old "if left() < 60: break" then silently dropped everything
+                # after the first few phrases (subtitles only for the first ~20s).
+                # Now: a translation deadline, and once we are slow or short on
+                # time the rest is translated with the offline Argos model.
+                tr_deadline = time.time() + max(60, left() - 170)
+                offline = False
                 for gs, ge, gt in groups:
-                    if left() < 60:
-                        break
-                    fa = translate(gt)
+                    t0 = time.time()
+                    try:
+                        if offline or time.time() > tr_deadline:
+                            fa = translate(gt, _argos)
+                        else:
+                            fa = translate(gt)
+                    except Exception as ex:                      # noqa
+                        log("segment translation failed, trying offline:", str(ex)[:120])
+                        try:
+                            fa = translate(gt, _argos)
+                        except Exception:                        # noqa
+                            fa = ""
+                    if time.time() - t0 > 20:
+                        offline = True       # online engines are throttled: stop wasting time on them
                     if fa:
                         segs.append((gs, max(ge, gs + 1.0), fa))
+                log("subtitle segments: %d of %d phrases (offline fallback=%s)" % (len(segs), len(groups), offline))
         except Exception as ex:                                  # noqa
             log("whisper failed:", str(ex)[:200])
             segs = []
