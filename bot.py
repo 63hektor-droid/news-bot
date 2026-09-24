@@ -191,6 +191,8 @@ FEED_REPLACE = {
     "The National": ["https://www.thenationalnews.com/arc/outboundfeeds/rss/?outputType=xml",
                      GN % ("thenationalnews.com", "Iran")],
 }
+FEED_REPLACE["Newsweek"] = [GN % ("newsweek.com", "Iran"),
+                            GN % ("newsweek.com", "(Israel+OR+Hormuz+OR+nuclear+OR+Gulf)")]
 FEED_EXTRA = {
     "Newsweek": [GN % ("newsweek.com", "Iran")],
 }
@@ -448,6 +450,44 @@ def fetch_feed(src, url):
     return out
 
 
+def fetch_page_summary(link, title=""):
+    """Google-News feeds (Reuters, AP, France 24, Times of Israel, Haaretz) carry a
+    headline only, so those posts had no body text. Read the article page and take
+    its description (og:description / meta description, else the first real
+    paragraphs). Returns whole sentences only, or "" if the site blocks us."""
+    import requests
+    from bs4 import BeautifulSoup
+    try:
+        r = requests.get(link, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                         timeout=12)
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", "html"):
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        cands = []
+        for attrs in ({"property": "og:description"}, {"name": "description"},
+                      {"name": "twitter:description"}):
+            m = soup.find("meta", attrs=attrs)
+            if m and m.get("content"):
+                cands.append(clean_text(m["content"]))
+        paras = [clean_text(x.get_text(" ")) for x in soup.find_all("p")]
+        body = " ".join(x for x in paras if len(x) > 60)[:1200]
+        cands.append(body)
+        tl = title.lower().strip()
+        best = ""
+        for c in cands:
+            c = trim_complete(c, 900)
+            if len(c) > len(best) and c.lower().strip(" .") != tl and len(c) >= 40:
+                best = c
+        if best and len(best) < 250 and len(body) > len(best):      # a one-line meta tag: add the lead paragraphs
+            longer = trim_complete(body, 700)
+            if len(longer) > len(best) and longer.lower().startswith(best.lower()[:40]):
+                best = longer
+        return best
+    except Exception as ex:                                        # noqa
+        log("page summary failed (%s): %s" % (link[:60], str(ex)[:80]))
+        return ""
+
+
 def fetch_all(sources):
     jobs = [(s, u) for s in sources for u in s["urls"]]
     items, health = [], []
@@ -513,6 +553,8 @@ def select(items, state):
             if a["pts"] > 0:
                 near_misses.append((a["pts"], a["strong"], a["medium"], it["title"]))
             continue
+        if not it["summary"] and len(it["title"].split()) < 4:
+            continue                       # a bare name/label like "Masoud Pezeshkian" is not a news item
         # only resolve the (few) items that actually made it past scoring - resolving
         # every raw item would mean hundreds of extra requests every run
         if "news.google.com" in it["link"]:
@@ -1603,6 +1645,9 @@ def git_push_state(state):
 #  Posting one item
 # =====================================================================
 def post_item(item, allow_video, state):
+    if not item["summary"] and left() > 60:
+        item["summary"] = fetch_page_summary(item["link"], item["title"])
+        log("page summary: %s" % ("%d chars" % len(item["summary"]) if item["summary"] else "none (site blocked/empty)"))
     title_fa = translate(item["title"])
     sum_fa = translate(item["summary"]) if item["summary"] else ""
     if not title_fa:
