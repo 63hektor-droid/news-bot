@@ -46,6 +46,7 @@ CHANNEL_ID = env("CHANNEL_ID", "")
 MAX_POSTS = int(env("MAX_POSTS_PER_RUN", 3))      # 3 posts per 5 min ~ 864/day max
 POST_GAP = int(env("POST_GAP_SEC", 90))           # spacing so posts arrive ~ every 1.5-2 min
 MIN_SCORE = int(env("MIN_SCORE", 4))
+WEAK_SCORE = int(env("WEAK_SCORE", 12))     # many weak regional terms together also count
 MAX_AGE_H = float(env("MAX_AGE_HOURS", 8))       # kept for reference; day-filter below is authoritative
 TEHRAN = ZoneInfo("Asia/Tehran")
 TIME_BUDGET = int(env("TIME_BUDGET_SEC", 540))      # video (download+whisper+burn) needs far more than 280s
@@ -159,6 +160,19 @@ def build_terms():
                 for en, fa in items]
 
 
+# Feed fixes applied on top of data.SOURCES (so data.py needs no edit):
+#   FEED_REPLACE swaps a dead URL list, FEED_EXTRA adds fallback feeds.
+GN = "https://news.google.com/rss/search?q=site:%s+%s+when:1d&hl=en-US&gl=US&ceid=US:en"
+FEED_REPLACE = {
+    "The National": ["https://www.thenationalnews.com/arc/outboundfeeds/rss/?outputType=xml",
+                     GN % ("thenationalnews.com", "Iran")],
+}
+FEED_EXTRA = {
+    "Arab News": [GN % ("arabnews.com", "Iran")],
+    "Newsweek": [GN % ("newsweek.com", "Iran")],
+}
+
+
 def load_sources():
     out = []
     for line in data.SOURCES.strip().splitlines():
@@ -166,13 +180,20 @@ def load_sources():
         if not line or line.startswith("#"):
             continue
         rank, tier, name, fa, urls = [p.strip() for p in line.split("|")]
-        out.append(dict(rank=int(rank), tier=tier, name=name, fa=fa, urls=urls.split()))
+        urls = FEED_REPLACE.get(name) or urls.split()
+        urls = urls + [u for u in FEED_EXTRA.get(name, []) if u not in urls]
+        out.append(dict(rank=int(rank), tier=tier, name=name, fa=fa, urls=urls))
     return out
 
 
 # =====================================================================
 #  Relevance scoring
 # =====================================================================
+MENA_RX = re.compile(r"\b(lebanon|lebanese|beirut|gaza|israel\w*|syria\w*|iraq\w*|yemen\w*|houthi\w*|"
+                     r"hezbollah|hamas|gulf|saudi|qatar\w*|oman|kuwait\w*|bahrain\w*|uae|emirat\w*|"
+                     r"middle east|red sea|hormuz|persian)\b")
+
+
 def analyze(title, summary):
     tl, sl = title.lower(), (summary or "").lower()
     pts, strong, medium = 0, 0, 0
@@ -191,7 +212,9 @@ def analyze(title, summary):
         if cat not in ("iran", "org"):
             cats[cat] += p
     pts = min(pts, 30)
-    ok = (strong >= 1 or (medium >= 2 and pts >= 6)) and pts >= MIN_SCORE
+    weak_ok = pts >= WEAK_SCORE and MENA_RX.search(tl + " " + sl) is not None
+    ok = ((strong >= 1 or (medium >= 2 and pts >= 6) or weak_ok)
+          and pts >= MIN_SCORE)
     tags = [CAT_TAGS[c] for c, _ in cats.most_common(3) if c in CAT_TAGS][:2]
     return dict(pts=pts, strong=strong, medium=medium, ok=ok, tags=["#ایران"] + tags)
 
@@ -348,8 +371,17 @@ def resolve_gnews_link(url):
 def fetch_feed(src, url):
     import requests
     import feedparser
-    r = requests.get(url, headers={"User-Agent": UA, "Accept": "application/rss+xml,application/atom+xml,"
-                                   "application/xml;q=0.9,*/*;q=0.8"}, timeout=20)
+    header_sets = [
+        {"User-Agent": UA, "Accept": "application/rss+xml,application/atom+xml,application/xml;q=0.9,*/*;q=0.8"},
+        {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language": "en-US,en;q=0.9"},
+        {"User-Agent": "Feedly/1.0 (+http://www.feedly.com/fetcher.html; like FeedFetcher-Google)", "Accept": "*/*"},
+    ]
+    r = None
+    for hdr in header_sets:
+        r = requests.get(url, headers=hdr, timeout=20)
+        if r.status_code not in (403, 406):
+            break
     if r.status_code != 200:
         raise RuntimeError("HTTP %d" % r.status_code)
     fp = feedparser.parse(r.content)
@@ -498,11 +530,8 @@ _DIG = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 TRANSLATE_EMAIL = env("TRANSLATE_EMAIL", "63hektor@gmail.com")   # raises MyMemory daily quota 5000 -> 50000 chars
 
 
-LIBRE_MIRRORS = (
-    "https://libretranslate.de/translate",
-    "https://translate.terraprint.co/translate",
-    "https://libretranslate.com/translate",
-)
+# public mirrors are dead / need an API key; set LIBRE_URL (+ keep empty otherwise)
+LIBRE_MIRRORS = tuple(u for u in env("LIBRE_URL", "").split() if u)
 
 
 def _libre(text):
@@ -574,58 +603,56 @@ def _looks_translated(out):
     return fa >= lat
 
 
+_GOOGLE_DEAD_UNTIL = 0.0      # circuit breaker: Google rate-limit (429) -> skip it for a while
+
+
 def _gt(text):
+    global _GOOGLE_DEAD_UNTIL
     from deep_translator import MyMemoryTranslator, GoogleTranslator
     import random
     last = None
-    # 0) Google - free, no key; by far the most fluent Persian output of the
-    #    free options, so it gets the most retries before anything weaker.
-    for i in range(3):
+    # 0) Google - most fluent free option. After ONE 429 it is switched off for
+    #    10 minutes so the run never wastes minutes on doomed retries.
+    if time.time() >= _GOOGLE_DEAD_UNTIL:
         try:
-            time.sleep(0.6 + random.uniform(0, 0.8))
+            time.sleep(0.3 + random.uniform(0, 0.4))
             out = GoogleTranslator(source="auto", target="fa").translate(text)
             if _looks_translated(out):
                 return out
             last = RuntimeError("Google returned non-Persian/unchanged text")
             log("Google output failed the Persian-content check, trying next engine")
-            break
         except Exception as ex:                                  # noqa
             last = ex
-            log("Google failed (try %d/3): %s" % (i + 1, str(ex)[:150]))
-            if i < 2:
-                is_429 = "429" in str(ex) or "too many requests" in str(ex).lower()
-                base = 15 if is_429 else 4
-                time.sleep(base * (2 ** i) + random.uniform(0, 3))
-    # 1) LibreTranslate - a real neural engine on different infrastructure.
-    try:
-        out = _libre(text)
-        if _looks_translated(out):
-            return out
-        last = RuntimeError("LibreTranslate returned non-Persian/unchanged text")
-        log("LibreTranslate output failed the Persian-content check, trying next engine")
-    except Exception as ex:                                      # noqa
-        last = ex
-        log("LibreTranslate failed: %s" % str(ex)[:200])
-    # 2) MyMemory - translation-memory based, often returns partial/odd
-    #    sentences, so it is only used after the two engines above. It also
-    #    refuses inputs over 500 chars.
+            msg = str(ex).lower()
+            if "429" in msg or "too many requests" in msg:
+                _GOOGLE_DEAD_UNTIL = time.time() + 600
+                log("Google rate-limited -> disabled for 10 min, using MyMemory/Argos")
+            else:
+                log("Google failed: %s" % str(ex)[:150])
+    # 1) LibreTranslate - only if mirrors are configured (public ones are dead/keyed)
+    if LIBRE_MIRRORS:
+        try:
+            out = _libre(text)
+            if _looks_translated(out):
+                return out
+            last = RuntimeError("LibreTranslate returned non-Persian/unchanged text")
+        except Exception as ex:                                  # noqa
+            last = ex
+            log("LibreTranslate failed: %s" % str(ex)[:200])
+    # 2) MyMemory - single quick try; refuses inputs over 500 chars.
     if len(text) <= 480:
-        for i in range(2):
-            try:
-                time.sleep(2 + random.uniform(0, 1.5))
-                kwargs = dict(source="en-GB", target="fa-IR")
-                if TRANSLATE_EMAIL:
-                    kwargs["email"] = TRANSLATE_EMAIL
-                out = MyMemoryTranslator(**kwargs).translate(text)
-                if _looks_translated(out):
-                    return out
-                last = RuntimeError("MyMemory returned non-Persian/unchanged text")
-                break
-            except Exception as ex:                              # noqa
-                last = ex
-                log("MyMemory failed (try %d/2): %s" % (i + 1, str(ex)[:150]))
-                time.sleep(3 + random.uniform(0, 2))
-    # 3) Argos Translate - offline, lowest fluency: true last resort.
+        try:
+            kwargs = dict(source="en-GB", target="fa-IR")
+            if TRANSLATE_EMAIL:
+                kwargs["email"] = TRANSLATE_EMAIL
+            out = MyMemoryTranslator(**kwargs).translate(text)
+            if _looks_translated(out):
+                return out
+            last = RuntimeError("MyMemory returned non-Persian/unchanged text")
+        except Exception as ex:                                  # noqa
+            last = ex
+            log("MyMemory failed: %s" % str(ex)[:150])
+    # 3) Argos Translate - offline, never rate-limited: last resort that always works.
     try:
         return _argos(text)
     except Exception as ex:                                      # noqa
