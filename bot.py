@@ -58,6 +58,7 @@ MAX_VIDEO_SEC = int(env("MAX_VIDEO_SECONDS", 180))
 MAX_VIDEO_MB = int(env("MAX_VIDEO_MB", 45))
 WHISPER_MODEL = env("WHISPER_MODEL", "base")
 DRY_RUN = env("DRY_RUN", "0") == "1"
+HISTORY_H = float(env("HISTORY_HOURS", 48))     # a story only counts as "already posted" for this long
 STATE_PATH = "state/posted.json"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -491,8 +492,8 @@ def common_words(old, min_frac=0.12):
 
 def select(items, state):
     seen = set(state["urls"])
-    old = [set(t) for t in state["titles"]]
-    common = common_words(old)
+    old = recent_titles(state)
+    common = common_words([set(t) for t in state["titles"]])
     old = [o - common for o in old]
     now = datetime.now(timezone.utc)
     today_ir = now.astimezone(TEHRAN).date()
@@ -535,8 +536,12 @@ def select(items, state):
     for it in pool:
         tk = toks(it["title"]) - common
         it["tk"] = tk
-        if any(similar(tk, o) for o in old):
+        hit = next((o for o in old if similar(tk, o)), None)
+        if hit is not None:
             n_hist += 1
+            if n_hist <= 5:
+                log("  suppressed (shares %s with a recent post): %s"
+                    % (sorted(tk & hit)[:6], it["title"][:80]))
             continue
         dup = next((c for c in chosen if similar(tk, c["tk"])), None)
         if dup:
@@ -1504,9 +1509,22 @@ def load_state():
         s.setdefault("titles", [])
         s.setdefault("images", [])
         s.setdefault("img_fp", [])
+        s.setdefault("title_seen", {})
+        for t in s["titles"]:                     # legacy entries get stamped "now" and expire normally
+            s["title_seen"].setdefault(" ".join(t), time.time())
         return s
     except Exception:                                            # noqa
-        return {"urls": [], "titles": [], "images": [], "img_fp": []}
+        return {"urls": [], "titles": [], "images": [], "img_fp": [], "title_seen": {}}
+
+
+def recent_titles(state):
+    """Token sets of stories posted within HISTORY_H hours. Without this limit the
+    500-title history suppressed every new story on a recurring topic (Hormuz, talks...)
+    for days - 21 of 21 relevant items were being dropped as 'already posted'."""
+    now = time.time()
+    seen = state.get("title_seen", {})
+    return [set(t) for t in state["titles"]
+            if now - seen.get(" ".join(t), now) < HISTORY_H * 3600]
 
 
 def save_state(s):
@@ -1514,6 +1532,8 @@ def save_state(s):
     s["titles"] = s["titles"][-500:]
     s["images"] = s.get("images", [])[-500:]
     s["img_fp"] = s.get("img_fp", [])[-500:]
+    keep = {" ".join(t) for t in s["titles"]}
+    s["title_seen"] = {k: v for k, v in s.get("title_seen", {}).items() if k in keep}
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False)
@@ -1542,6 +1562,8 @@ def refresh_seen(state):
     for t in fresh.get("titles", []):
         if t not in state["titles"]:
             state["titles"].append(t)
+    for k, v in fresh.get("title_seen", {}).items():
+        state.setdefault("title_seen", {}).setdefault(k, v)
     for im in fresh.get("images", []):
         if im not in state.get("images", []):
             state.setdefault("images", []).append(im)
@@ -1682,7 +1704,7 @@ def main():
             break
         if not DRY_RUN and i > 0:
             refresh_seen(state)      # re-check right before each post, not just once at the top
-        if it["link"] in state["urls"] or any(similar(it["tk"], set(t)) for t in state["titles"]):
+        if it["link"] in state["urls"] or any(similar(it["tk"], o) for o in recent_titles(state)):
             log("skipping, already posted (concurrent run caught it first): %s" % it["title"][:80])
             continue
         try:
@@ -1699,6 +1721,7 @@ def main():
             videos += 1 if res == "video" else 0
             state["urls"] += [it["link"]] + it["dups"]
             state["titles"].append(sorted(it["tk"]))
+            state.setdefault("title_seen", {})[" ".join(sorted(it["tk"]))] = time.time()
             if DRY_RUN:
                 save_state(state)
             else:
