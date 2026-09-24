@@ -164,11 +164,11 @@ def build_terms():
 #   FEED_REPLACE swaps a dead URL list, FEED_EXTRA adds fallback feeds.
 GN = "https://news.google.com/rss/search?q=site:%s+%s+when:1d&hl=en-US&gl=US&ceid=US:en"
 FEED_REPLACE = {
+    "Arab News": [GN % ("arabnews.com", "Iran"), GN % ("arabnews.com", "(Gulf+OR+Hormuz+OR+nuclear)")],
     "The National": ["https://www.thenationalnews.com/arc/outboundfeeds/rss/?outputType=xml",
                      GN % ("thenationalnews.com", "Iran")],
 }
 FEED_EXTRA = {
-    "Arab News": [GN % ("arabnews.com", "Iran")],
     "Newsweek": [GN % ("newsweek.com", "Iran")],
 }
 
@@ -397,6 +397,8 @@ def fetch_feed(src, url):
         if gnews:
             title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
             summ = ""
+            if len(title.split()) < 4:          # topic/person hub pages, not real headlines
+                continue
         else:
             summ = clean_text(e.get("summary") or e.get("description") or "")
             if summ.lower() == title.lower():
@@ -414,7 +416,9 @@ def fetch_feed(src, url):
             # be confirmed without a real timestamp.
             continue
         img, vid = entry_media(e)
-        page_video = bool(re.search(r"/videos?/|/video-|/watch", link)) and not gnews
+        page_video = (bool(re.search(r"/videos?/|/video-|/watch", link)) and not gnews
+                      and not any(h in link for h in ("bloomberg.com", "wsj.com", "ft.com", "nytimes.com",
+                                                      "washingtonpost.com", "economist.com")))
         out.append(dict(title=title, summary=trim_complete(summ, 900), link=link, time=t, src=src["name"],
                         src_fa=src["fa"], tier=src["tier"], rank=src["rank"],
                         img=img, video=vid, page_video=page_video))
@@ -1256,7 +1260,17 @@ def find_video_urls(link):
     return found[:4]
 
 
+VIDEO_BLOCKED = ("bloomberg.com", "wsj.com", "ft.com", "nytimes.com", "washingtonpost.com",
+                 "economist.com", "news.google.com")
+
+
+def video_blocked(link):
+    return any(h in (link or "") for h in VIDEO_BLOCKED)
+
+
 def _scan_video(item):
+    if video_blocked(item.get("link")):
+        return
     urls = find_video_urls(item["link"])
     if urls:
         item["vurls"] = urls
@@ -1512,7 +1526,8 @@ def post_item(item, allow_video, state):
         log("---- DRY RUN ----\n" + build_post(item, title_fa, sum_fa, 1000))
         return True
 
-    if allow_video and ENABLE_VIDEO and not (item.get("video") or item.get("page_video")):
+    if allow_video and ENABLE_VIDEO and not (item.get("video") or item.get("page_video")) \
+            and not video_blocked(item["link"]):
         urls = find_video_urls(item["link"])
         if urls:
             item["vurls"], item["page_video"] = urls, True
