@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Iran-news Telegram bot  (runs on GitHub Actions, every 5 minutes)
+Iran-news Telegram bot  (runs on GitHub Actions, every ~2 minutes)
 
 Every run:
   1. reads RSS feeds of 20 foreign news agencies (data.SOURCES)
@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import Counter
@@ -116,6 +117,20 @@ def _rx(term):
     return re.compile(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])")
 
 
+WEAKEN = set("""
+supreme leader, islamic republic, arak, shiraz, abu musa, chamran, safir, simorgh, phosphorus,
+handala, flame malware, khayyam, kowsar, hodhod, nazer, zafar satellite, hengam,
+capital market, pension fund, retirement fund, civil servants pension, agricultural bank,
+tourism bank, day bank, dey bank, middle east bank, sarmayeh bank, shahr bank, sina bank,
+maskan bank, bank maskan, ansar bank, refah bank, social security organization,
+securities and exchange organization, mizan, javan, etemad, shargh, kayhan, sazandegi,
+general inspectorate, prosecutor general, cyber police, iran press, ham-mihan, hammihan,
+esmaili, hejazi, farzin, sanaei, rabiei, hojatoleslam, hojjatoleslam, motahari, hemmati,
+mokhber, iravani, abutalebi, akhoundi
+""".replace("\n", " ").split(","))
+WEAKEN = {t.strip() for t in WEAKEN if t.strip()}
+
+
 def build_terms():
     best = {}
 
@@ -147,6 +162,13 @@ def build_terms():
             add(t, 3, "politics")
     for t in data.ORGANIZATIONS.replace("\n", ",").split(","):
         add(t, 3, "org")
+    # Generic words that data.py lists as if they were uniquely Iranian (a "pension
+    # fund" or the "Agricultural Bank of China" is not Iran news; North Korea also has a
+    # "supreme leader"; shiraz is a wine). Downgraded to weak (weight 1) here so that
+    # data.py needs no edit: they now only count together with a real Iran term.
+    for t in WEAKEN:
+        if t in best:
+            best[t] = (1, best[t][1])
     TERMS[:] = [(t, wc[0], wc[1], _rx(t)) for t, wc in best.items()]
 
     items = []
@@ -509,19 +531,24 @@ def select(items, state):
         log("  near-miss pts=%2d strong=%d med=%d  %s" % (pts, strong, medium, title[:90]))
     pool.sort(key=lambda x: (-x["total"], x["rank"]))
     chosen = []
+    n_hist = n_dup = 0
     for it in pool:
         tk = toks(it["title"]) - common
         it["tk"] = tk
         if any(similar(tk, o) for o in old):
+            n_hist += 1
             continue
         dup = next((c for c in chosen if similar(tk, c["tk"])), None)
         if dup:
+            n_dup += 1
             if it["src_fa"] != dup["src_fa"] and it["src_fa"] not in dup["also"]:
                 dup["also"].append(it["src_fa"])
             dup["dups"].append(it["link"])
             continue
         it["also"], it["dups"] = [], []
         chosen.append(it)
+    log("de-dup: pool=%d | similar to already-posted=%d | duplicate of another candidate=%d | kept=%d"
+        % (len(pool), n_hist, n_dup, len(chosen)))
     return pool, chosen
 
 
@@ -610,7 +637,22 @@ def _looks_translated(out):
 _GOOGLE_DEAD_UNTIL = 0.0      # circuit breaker: Google rate-limit (429) -> skip it for a while
 
 
+_TR_CACHE = {}
+
+
 def _gt(text):
+    """Memoised wrapper: the same chunk is often translated twice (glossary
+    retry, same sentence in title and summary) - never spend a rate-limited
+    request on it again within one run."""
+    hit = _TR_CACHE.get(text)
+    if hit is not None:
+        return hit
+    out = _gt_uncached(text)
+    _TR_CACHE[text] = out
+    return out
+
+
+def _gt_uncached(text):
     global _GOOGLE_DEAD_UNTIL
     from deep_translator import MyMemoryTranslator, GoogleTranslator
     import random
@@ -1071,6 +1113,9 @@ def video_preflight():
     log("video: enabled=%s | ffmpeg=%s | ffprobe=%s | yt_dlp=%s | faster_whisper=%s | budget=%ds"
         % (ENABLE_VIDEO, bool(shutil.which("ffmpeg")), bool(shutil.which("ffprobe")),
            has("yt_dlp"), has("faster_whisper"), TIME_BUDGET))
+    if ENABLE_VIDEO and not DRY_RUN and not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        log("ffmpeg missing -> installing in the background while feeds are fetched")
+        threading.Thread(target=ensure_tools, daemon=True).start()
     if ENABLE_VIDEO and not has("yt_dlp"):
         log("WARNING: yt-dlp is not installed -> article-page videos can never be fetched "
             "(add 'yt-dlp' to the pip install step)")
@@ -1078,7 +1123,26 @@ def video_preflight():
         log("WARNING: faster-whisper is not installed -> videos go out without Persian subtitles")
 
 
+_TOOLS_LOCK = threading.Lock()
+_TOOLS_DONE = False
+_TOOLS_FONT = None
+
+
 def ensure_tools():
+    """Memoised + locked wrapper. video_preflight() starts this in a background
+    thread at the beginning of the run (ffmpeg/fonts install takes ~30-60 s), so
+    it overlaps with feed fetching instead of eating the video time budget."""
+    global _TOOLS_DONE, _TOOLS_FONT
+    with _TOOLS_LOCK:
+        if not _TOOLS_DONE:
+            try:
+                _TOOLS_FONT = _ensure_tools()
+            finally:
+                _TOOLS_DONE = True
+        return _TOOLS_FONT
+
+
+def _ensure_tools():
     """Returns the Persian font family to burn subtitles with, or None if
     ffmpeg or a real Persian font couldn't be made available. Falling back
     to a non-Persian font (e.g. DejaVu Sans) would burn broken/undisplayable
