@@ -507,10 +507,12 @@ def fetch_page_summary(link, title=""):
             c = trim_complete(c, 900)
             if len(c) > len(best) and c.lower().strip(" .") != tl and len(c) >= 40:
                 best = c
-        if best and len(best) < 250 and len(body) > len(best):      # a one-line meta tag: add the lead paragraphs
-            longer = trim_complete(body, 700)
-            if len(longer) > len(best) and longer.lower().startswith(best.lower()[:40]):
-                best = longer
+        if best and len(best) < 220:                   # a one-line meta tag: add the lead paragraphs
+            lead = " ".join(x for x in paras if len(x) > 60)[:700]
+            lead = lead.replace(best[:60], "") if best[:60] in lead else lead
+            extra = trim_complete(lead, 450) if len(lead) > 80 else ""
+            if extra and extra.lower()[:50] not in best.lower():
+                best = trim_complete(best.rstrip() + " " + extra, 650)
         return best
     except Exception as ex:                                        # noqa
         log("page summary failed (%s): %s" % (link[:60], str(ex)[:80]))
