@@ -397,6 +397,64 @@ def entry_media(e):
     return img, vid
 
 
+_BOILERPLATE = (
+    "comprehensive, up-to-date news coverage",
+    "aggregated from sources all over the world",
+    "aggregated from sources around the world",
+    "enable javascript",
+    "enable cookies",
+    "just a moment...",
+    "access denied",
+    "are you a robot",
+)
+
+
+def _is_boilerplate(s):
+    s = (s or "").lower()
+    return any(b in s for b in _BOILERPLATE)
+
+
+def _gn_decode(url):
+    """Resolve modern Google News article tokens (no HTTP redirect any more)
+    to the real publisher URL. Returns "" on failure."""
+    import base64, json, requests
+    from urllib.parse import quote
+    m = re.search(r"/articles/([^/?#]+)", url)
+    if not m:
+        return ""
+    art_id = m.group(1)
+    # old-style ids embed the URL directly in the base64 payload
+    try:
+        raw = base64.urlsafe_b64decode(art_id + "=" * (-len(art_id) % 4)).decode("latin1")
+        mm = re.search(r"https?://[^\x00-\x20\"<>]+", raw)
+        if mm and "news.google.com" not in mm.group(0):
+            return mm.group(0)
+    except Exception:                                              # noqa
+        pass
+    try:
+        page = requests.get("https://news.google.com/rss/articles/" + art_id,
+                            headers={"User-Agent": UA}, timeout=10).text
+        sg = re.search(r'data-n-a-sg="([^"]+)"', page)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', page)
+        if not (sg and ts):
+            return ""
+        inner = ('["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,'
+                 'null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"%s",%s,"%s"]'
+                 % (art_id, ts.group(1), sg.group(1)))
+        body = "f.req=" + quote(json.dumps([[["Fbv4je", inner]]]))
+        r = requests.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                          headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                                   "User-Agent": UA},
+                          data=body, timeout=12)
+        parsed = json.loads(r.text.split("\n\n")[1])[:-2]
+        out = json.loads(parsed[0][2])[1]
+        if out.startswith("http") and "news.google.com" not in out:
+            return out
+    except Exception as ex:                                        # noqa
+        log("gnews decode failed: %s" % str(ex)[:80])
+    return ""
+
+
 def resolve_gnews_link(url):
     """Google News RSS article links are opaque, per-fetch redirect tokens - the
     exact same story can get a different link every time the feed is polled,
@@ -419,7 +477,8 @@ def resolve_gnews_link(url):
                 return r.url
     except Exception:                                              # noqa
         pass
-    return url
+    real = _gn_decode(url)
+    return real or url
 
 
 def fetch_feed(src, url):
@@ -491,6 +550,8 @@ def fetch_page_summary(link, title=""):
                          timeout=12)
         if r.status_code != 200 or "html" not in r.headers.get("content-type", "html"):
             return ""
+        if "news.google.com" in (r.url or ""):     # still Google's page, not the article
+            return ""
         soup = BeautifulSoup(r.text, "html.parser")
         cands = []
         for attrs in ({"property": "og:description"}, {"name": "description"},
@@ -505,6 +566,8 @@ def fetch_page_summary(link, title=""):
         best = ""
         for c in cands:
             c = trim_complete(c, 900)
+            if _is_boilerplate(c):
+                continue
             if len(c) > len(best) and c.lower().strip(" .") != tl and len(c) >= 40:
                 best = c
         if best and len(best) < 220:                   # a one-line meta tag: add the lead paragraphs
@@ -1679,6 +1742,8 @@ def post_item(item, allow_video, state):
     if not item["summary"] and left() > 60:
         item["summary"] = fetch_page_summary(item["link"], item["title"])
         log("page summary: %s" % ("%d chars" % len(item["summary"]) if item["summary"] else "none (site blocked/empty)"))
+    if _is_boilerplate(item["summary"]):
+        item["summary"] = ""
     title_fa = translate(item["title"])
     sum_fa = translate(item["summary"]) if item["summary"] else ""
     if not title_fa:
