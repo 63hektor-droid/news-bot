@@ -397,21 +397,44 @@ def entry_media(e):
     return img, vid
 
 
+# Generic text that Google News (and bot-wall / consent / error pages) put in the
+# description of a page instead of a real article summary. If one of these slips
+# through, the same sentence gets posted under many different news items.
 _BOILERPLATE = (
     "comprehensive, up-to-date news coverage",
+    "comprehensive up-to-date news coverage",
+    "up-to-date news coverage",
     "aggregated from sources all over the world",
     "aggregated from sources around the world",
+    "aggregated from sources",
+    "from sources all over the world",
+    "google news",
     "enable javascript",
     "enable cookies",
     "just a moment...",
+    "just a moment",
     "access denied",
     "are you a robot",
+    "verify you are human",
+    "checking your browser",
+    "attention required",
+    "subscribe to continue",
+    "before you continue",
 )
 
 
 def _is_boilerplate(s):
-    s = (s or "").lower()
-    return any(b in s for b in _BOILERPLATE)
+    s = re.sub(r"[\u2010-\u2015\u00a0]", " ", (s or "").lower())
+    s = re.sub(r"\s+", " ", s)
+    if any(b in s for b in _BOILERPLATE):
+        return True
+    return "aggregated" in s and "sources" in s
+
+
+def _is_google_host(url):
+    host = urlsplit(url or "").netloc.lower()
+    return (host == "google.com" or host.endswith(".google.com")
+            or ".google." in host or host.endswith("googleusercontent.com"))
 
 
 def _gn_decode(url):
@@ -466,14 +489,14 @@ def resolve_gnews_link(url):
     import requests
     try:
         r = requests.head(url, headers={"User-Agent": UA}, timeout=8, allow_redirects=True)
-        if r.url and "news.google.com" not in r.url:
+        if r.url and not _is_google_host(r.url):
             return r.url
     except Exception:                                              # noqa
         pass
     try:
         with requests.get(url, headers={"User-Agent": UA}, timeout=10,
                            allow_redirects=True, stream=True) as r:
-            if r.url and "news.google.com" not in r.url:
+            if r.url and not _is_google_host(r.url):
                 return r.url
     except Exception:                                              # noqa
         pass
@@ -516,6 +539,8 @@ def fetch_feed(src, url):
             summ = clean_text(e.get("summary") or e.get("description") or "")
             if summ.lower() == title.lower():
                 summ = ""
+            if _is_boilerplate(summ):
+                summ = ""
         t = None
         for k in ("published_parsed", "updated_parsed"):
             if e.get(k):
@@ -542,15 +567,18 @@ def fetch_page_summary(link, title=""):
     """Google-News feeds (Reuters, AP, France 24, Times of Israel, Haaretz) carry a
     headline only, so those posts had no body text. Read the article page and take
     its description (og:description / meta description, else the first real
-    paragraphs). Returns whole sentences only, or "" if the site blocks us."""
+    paragraphs). Returns whole sentences only, or "" if the site blocks us or the
+    page is not the real article (Google page, consent wall, generic boilerplate)."""
     import requests
     from bs4 import BeautifulSoup
+    if not link or _is_google_host(link):        # never scrape a Google page as if it were the article
+        return ""
     try:
         r = requests.get(link, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
                          timeout=12)
         if r.status_code != 200 or "html" not in r.headers.get("content-type", "html"):
             return ""
-        if "news.google.com" in (r.url or ""):     # still Google's page, not the article
+        if _is_google_host(r.url or ""):           # redirected to Google's page, not the article
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
         cands = []
@@ -560,6 +588,7 @@ def fetch_page_summary(link, title=""):
             if m and m.get("content"):
                 cands.append(clean_text(m["content"]))
         paras = [clean_text(x.get_text(" ")) for x in soup.find_all("p")]
+        paras = [x for x in paras if not _is_boilerplate(x)]
         body = " ".join(x for x in paras if len(x) > 60)[:1200]
         cands.append(body)
         tl = title.lower().strip()
@@ -576,6 +605,8 @@ def fetch_page_summary(link, title=""):
             extra = trim_complete(lead, 450) if len(lead) > 80 else ""
             if extra and extra.lower()[:50] not in best.lower():
                 best = trim_complete(best.rstrip() + " " + extra, 650)
+        if _is_boilerplate(best):
+            return ""
         return best
     except Exception as ex:                                        # noqa
         log("page summary failed (%s): %s" % (link[:60], str(ex)[:80]))
@@ -957,6 +988,18 @@ def translate(text, translator=None):
     return fix_fa(" ".join(o.strip() for o in outs if o and o.strip()))
 
 
+# Persian renderings of the Google News boilerplate ("پوشش جامع و به‌روز اخبار ... گوگل نیوز").
+# Last safety net in case the English check missed it: such a summary is dropped.
+_FA_BOILERPLATE = ("گوگل نیوز", "گوگل‌نیوز", "گوگل نیوز", "پوشش جامع و به‌روز", "پوشش جامع و بهروز",
+                   "پوشش خبری جامع و به‌روز", "پوشش خبری جامع و بهروز")
+
+
+def _fa_is_boilerplate(s):
+    s = (s or "").replace("\u200c", "‌")
+    flat = s.replace("\u200c", "")
+    return any(b.replace("\u200c", "") in flat for b in _FA_BOILERPLATE)
+
+
 # =====================================================================
 #  Telegram
 # =====================================================================
@@ -1020,12 +1063,12 @@ def build_post(item, title_fa, sum_fa, limit):
 
 
 def og_image(url):
-    if "news.google.com" in url:
+    if _is_google_host(url):
         return None
     try:
         import requests
         r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
-        if r.status_code != 200:
+        if r.status_code != 200 or _is_google_host(r.url or ""):
             return None
         for pat in (r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
                     r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']'):
@@ -1176,7 +1219,7 @@ def image_candidates(item, state):
     rss_img = item.get("img")
     if usable(rss_img):
         yield rss_img
-    if "news.google.com" not in item["link"]:
+    if not _is_google_host(item["link"]):
         scraped = og_image(item["link"])
         if scraped and scraped != rss_img and usable(scraped):
             yield scraped
@@ -1245,6 +1288,7 @@ def ensure_python_deps():
 def video_preflight():
     """One log line that tells at a glance why videos are (not) working."""
     ensure_python_deps()
+
     def has(mod):
         try:
             __import__(mod)
@@ -1739,13 +1783,21 @@ def git_push_state(state):
 #  Posting one item
 # =====================================================================
 def post_item(item, allow_video, state):
-    if not item["summary"] and left() > 60:
+    # Read the article page for a summary only when the link is a REAL publisher
+    # URL. If the Google News link could not be resolved, scraping it returns
+    # Google's own generic page ("Comprehensive, up-to-date news coverage ...")
+    # and that sentence was being posted as the news summary.
+    if not item["summary"] and left() > 60 and not _is_google_host(item["link"]):
         item["summary"] = fetch_page_summary(item["link"], item["title"])
         log("page summary: %s" % ("%d chars" % len(item["summary"]) if item["summary"] else "none (site blocked/empty)"))
     if _is_boilerplate(item["summary"]):
+        log("dropping boilerplate summary: %s" % item["summary"][:80])
         item["summary"] = ""
     title_fa = translate(item["title"])
     sum_fa = translate(item["summary"]) if item["summary"] else ""
+    if sum_fa and _fa_is_boilerplate(sum_fa):
+        log("dropping boilerplate Persian summary: %s" % sum_fa[:80])
+        sum_fa = ""
     if not title_fa:
         raise RuntimeError("empty translation")
 
@@ -1822,7 +1874,7 @@ def main():
     todo = chosen[:MAX_POSTS]
     if ENABLE_VIDEO and MAX_VIDEOS > 0 and chosen:
         scan = [c for c in chosen[:VIDEO_SCAN] if not c.get("video") and not c.get("page_video")
-                and "news.google.com" not in c["link"]]
+                and not video_blocked(c["link"])]
         if scan:
             with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(_scan_video, scan))
@@ -1900,6 +1952,19 @@ def selftest():
         flag = "OK " if a["ok"] == want else "BAD"
         bad += a["ok"] != want
         log("%s pts=%2d strong=%d med=%d %s" % (flag, a["pts"], a["strong"], a["medium"], title[:70]))
+    # Google News boilerplate must never be accepted as a summary
+    for junk in ("Comprehensive, up-to-date news coverage, aggregated from sources all over the world by Google News.",
+                 "Comprehensive up-to-date news coverage \u2013 aggregated from sources around the world by Google News",
+                 "Google News",
+                 "Just a moment...",
+                 "Enable JavaScript and cookies to continue"):
+        assert _is_boilerplate(junk), junk
+    assert not _is_boilerplate("Iran says it is ready to resume talks with Washington if sanctions are lifted.")
+    assert _is_google_host("https://news.google.com/rss/articles/abc")
+    assert _is_google_host("https://consent.google.com/ml?continue=x")
+    assert not _is_google_host("https://www.reuters.com/world/iran/story")
+    assert _fa_is_boilerplate("پوشش جامع و به‌روز اخبار، جمع‌آوری‌شده از منابع مختلف توسط گوگل نیوز.")
+    assert not _fa_is_boilerplate("ایران آمادگی خود را برای از سرگیری مذاکرات اعلام کرد.")
     # glossary round trip with a fake translator that keeps the tokens
     fake = lambda s: s.replace("was seized", "توقیف شد")                 # noqa
     out = translate("IRGC seized a tanker in the Strait of Hormuz", fake)
