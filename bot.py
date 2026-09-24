@@ -198,6 +198,31 @@ FEED_EXTRA = {
 }
 
 
+GNQ = "https://news.google.com/rss/search?q=%s+when:1d&hl=en-US&gl=US&ceid=US:en"
+IRAN_TOPICS = "(Iran+OR+Hormuz+OR+nuclear+OR+sanctions+OR+IRGC+OR+Tehran)"
+# Extra agencies added on top of data.py (so data.py needs no edit).
+# (rank, tier, name, persian name, feed urls). Broken feeds are simply skipped and logged.
+EXTRA_SOURCES = [
+    (31, "A", "AFP", "خبرگزاری فرانسه (AFP)",
+     [GNQ % "AFP+Iran", GNQ % "AFP+(Israel+OR+Hormuz+OR+nuclear+OR+Gulf+OR+sanctions)"]),
+    (32, "A", "IAEA", "آژانس بین‌المللی انرژی اتمی (منبع رسمی)",
+     ["https://www.iaea.org/feeds/topnews", GN % ("iaea.org", "(Iran+OR+safeguards+OR+enrichment)")]),
+    (33, "A", "US Treasury (OFAC)", "خزانه‌داری آمریکا (منبع رسمی)",
+     [GN % ("home.treasury.gov", "(Iran+OR+sanctions)"), GN % ("ofac.treasury.gov", "Iran")]),
+    (34, "B", "Axios", "اکسیوس",
+     ["https://api.axios.com/feed/", GN % ("axios.com", IRAN_TOPICS)]),
+    (35, "B", "Fox News", "فاکس‌نیوز",
+     ["https://moxie.foxnews.com/google-publisher/world.xml", GN % ("foxnews.com", IRAN_TOPICS)]),
+    (36, "B", "UN News", "اخبار سازمان ملل",
+     ["https://news.un.org/feed/subscribe/en/news/region/middle-east/feed/rss.xml",
+      "https://news.un.org/feed/subscribe/en/news/topic/peace-and-security/feed/rss.xml"]),
+    (37, "C", "Al Arabiya English", "العربیه (انگلیسی)",
+     [GN % ("english.alarabiya.net", "Iran"), GN % ("english.alarabiya.net", "(Gulf+OR+Hormuz+OR+nuclear+OR+Houthi)")]),
+    (38, "C", "Iran International", "ایران اینترنشنال (انگلیسی)",
+     [GN % ("iranintl.com", "Iran"), GN % ("iranintl.com", "(IRGC+OR+protest+OR+execution+OR+regime)")]),
+]
+
+
 def load_sources():
     out = []
     for line in data.SOURCES.strip().splitlines():
@@ -208,6 +233,10 @@ def load_sources():
         urls = FEED_REPLACE.get(name) or urls.split()
         urls = urls + [u for u in FEED_EXTRA.get(name, []) if u not in urls]
         out.append(dict(rank=int(rank), tier=tier, name=name, fa=fa, urls=urls))
+    have = {o["name"] for o in out}
+    for rank, tier, name, fa, urls in EXTRA_SOURCES:
+        if name not in have:
+            out.append(dict(rank=rank, tier=tier, name=name, fa=fa, urls=list(urls)))
     return out
 
 
@@ -1784,7 +1813,7 @@ def main():
 def selftest():
     build_terms()
     srcs = load_sources()
-    assert len(srcs) == 30, len(srcs)
+    assert len(srcs) == 30 + len(EXTRA_SOURCES), len(srcs)
     log("terms loaded:", len(TERMS))
     cases = [
         ("Iran says it will resume uranium enrichment at Fordow", "", True),
