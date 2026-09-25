@@ -1223,6 +1223,77 @@ def img_is_dup(fp, state):
     return False
 
 
+# ---- video validation --------------------------------------------------
+# Mirrors the image validation above: a video attached to a post must really
+# belong to THAT story. Two failure modes were seen: (1) a site-wide "hero"/
+# "trending" video widget that's embedded on many unrelated article pages and
+# gets picked up as if it were the article's own video, and (2) yt-dlp's
+# generic-page fallback grabbing an unrelated player (an ad, a "related
+# videos" reel) from a page that has more than one video embedded. Neither
+# is caught by URL inspection alone, so - exactly like images - every video
+# actually downloaded is content-fingerprinted and checked against every
+# video already posted for a *different* story; a repeat is rejected and the
+# next candidate is tried instead.
+GENERIC_VIDEO_PAT = re.compile(
+    r"(sponsor|advert|promo|trailer|stinger|bumper|ident|loop|placeholder|"
+    r"generic|default[-_]?video|site[-_]?video|masthead|hero[-_]?video)",
+    re.I,
+)
+
+
+def vid_looks_generic(url):
+    return bool(url) and bool(GENERIC_VIDEO_PAT.search(url))
+
+
+def vid_fp(path):
+    """Content fingerprint of a video file: sha1 of a chunk of the encoded
+    bytes plus a coarse perceptual hash of the first decoded frame. Cheap
+    (no full decode) but enough to catch the same physical clip being
+    reused - whether served from the same URL again or re-encoded by a
+    different article page."""
+    try:
+        import hashlib
+        with open(path, "rb") as f:
+            head = f.read(2_000_000)
+        if not head:
+            return None
+        sha = hashlib.sha1(head).hexdigest()
+        dh = None
+        try:
+            frame = os.path.join(os.path.dirname(path), "_fp_frame.jpg")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-ss", "0.5", "-i", path, "-frames:v", "1", "-vf", "scale=9:8", frame],
+                capture_output=True, timeout=20,
+            )
+            if r.returncode == 0 and os.path.exists(frame):
+                from PIL import Image
+                px = list(Image.open(frame).convert("L").getdata())
+                if len(px) >= 72:
+                    dh = 0
+                    for row in range(8):
+                        for col in range(8):
+                            dh = (dh << 1) | (1 if px[row * 9 + col] > px[row * 9 + col + 1] else 0)
+        except Exception:                                          # noqa
+            dh = None
+        return sha, dh
+    except Exception:                                              # noqa
+        return None
+
+
+def vid_is_dup(fp, state):
+    sha, dh = fp
+    for old in state.get("vid_fp", []):
+        try:
+            osha, odh = old
+        except Exception:                                          # noqa
+            continue
+        if osha == sha:
+            return True
+        if dh is not None and odh is not None and bin(dh ^ odh).count("1") <= 3:
+            return True
+    return False
+
+
 def image_candidates(item, state):
     """Yield validated image URLs for this specific item, best first: the
     RSS-supplied image, then the og:image of the item's own article page.
@@ -1552,12 +1623,15 @@ def _scan_video(item):
         item["page_video"] = True
 
 
-def fetch_video_source(item, tmp):
-    """Try each candidate until one is a real, playable, short-enough video.
-    Returns (path, (w, h, dur, has_audio, vcodec)) or None."""
+def fetch_video_source(item, tmp, state):
+    """Try each candidate until one is a real, playable, short-enough video
+    that isn't a duplicate of a video already posted for a DIFFERENT story
+    (a site-wide promo/hero video reused across many article pages, or the
+    same clip yt-dlp's generic extractor grabbed for an earlier item).
+    Returns (path, (w, h, dur, has_audio, vcodec), fp) or None."""
     cands = []
     for u in [item.get("video")] + list(item.get("vurls") or []):
-        if u and u not in cands:
+        if u and u not in cands and not vid_looks_generic(u):
             cands.append(u)
     if item.get("page_video") and item["link"] not in cands:
         cands.append(item["link"])
@@ -1581,7 +1655,11 @@ def fetch_video_source(item, tmp):
         if dur > MAX_VIDEO_SEC + 5:
             log("video too long (%ds > %ds): %s" % (dur, MAX_VIDEO_SEC, u[:90]))
             continue
-        return p, info
+        fp = vid_fp(p)
+        if fp is not None and vid_is_dup(fp, state):
+            log("skipping video, same clip already used for another story:", u[:90])
+            continue
+        return p, info, fp
     return None
 
 
@@ -1602,23 +1680,25 @@ def _ensure_mp4(tmp, src, vcodec):
     return None
 
 
-def make_video(item, tmp):
-    """Returns (path, w, h, dur, subtitled) or None."""
+def make_video(item, tmp, state):
+    """Returns (path, w, h, dur, subtitled, fp) or None. `fp` is the content
+    fingerprint of the source clip - the caller records it in state on a
+    successful post so the same clip can't be reused for a later story."""
     # ffmpeg/ffprobe must exist BEFORE anything is probed or merged
     font = ensure_tools()
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         log("no ffmpeg/ffprobe available even after install attempt - cannot post this video")
         return None
-    got = fetch_video_source(item, tmp)
+    got = fetch_video_source(item, tmp, state)
     if not got:
-        log("no playable video could be fetched for:", item["link"][:90])
+        log("no playable (non-duplicate) video could be fetched for:", item["link"][:90])
         return None
-    src, (w, h, dur, has_audio, vcodec) = got
+    src, (w, h, dur, has_audio, vcodec), fp = got
     log("video fetched: %dx%d %.0fs codec=%s audio=%s" % (w, h, dur, vcodec, has_audio))
 
     def plain():
         base = _ensure_mp4(tmp, src, vcodec)
-        return (base, w, h, dur, False) if base else None
+        return (base, w, h, dur, False, fp) if base else None
     if not font:
         log("skipping subtitles for this video: no Persian font available")
         return plain()
@@ -1684,7 +1764,7 @@ def make_video(item, tmp):
     outp = os.path.join(tmp, "out.mp4")
     for crf in ("26", "32"):
         if _burn(tmp, src, crf) and os.path.exists(outp) and os.path.getsize(outp) < 49 * 1024 * 1024:
-            return outp, w, h, dur, True
+            return outp, w, h, dur, True, fp
     log("burn-in failed, sending original video")
     return plain()
 
@@ -1715,12 +1795,13 @@ def load_state():
         s.setdefault("titles", [])
         s.setdefault("images", [])
         s.setdefault("img_fp", [])
+        s.setdefault("vid_fp", [])
         s.setdefault("title_seen", {})
         for t in s["titles"]:                     # legacy entries get stamped "now" and expire normally
             s["title_seen"].setdefault(" ".join(t), time.time())
         return s
     except Exception:                                            # noqa
-        return {"urls": [], "titles": [], "images": [], "img_fp": [], "title_seen": {}}
+        return {"urls": [], "titles": [], "images": [], "img_fp": [], "vid_fp": [], "title_seen": {}}
 
 
 def recent_titles(state):
@@ -1738,6 +1819,7 @@ def save_state(s):
     s["titles"] = s["titles"][-500:]
     s["images"] = s.get("images", [])[-500:]
     s["img_fp"] = s.get("img_fp", [])[-500:]
+    s["vid_fp"] = s.get("vid_fp", [])[-200:]
     keep = {" ".join(t) for t in s["titles"]}
     s["title_seen"] = {k: v for k, v in s.get("title_seen", {}).items() if k in keep}
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
@@ -1776,6 +1858,9 @@ def refresh_seen(state):
     for fp in fresh.get("img_fp", []):
         if fp not in state.setdefault("img_fp", []):
             state["img_fp"].append(fp)
+    for fp in fresh.get("vid_fp", []):
+        if fp not in state.setdefault("vid_fp", []):
+            state["vid_fp"].append(fp)
 
 
 def git_push_state(state):
@@ -1841,13 +1926,15 @@ def post_item(item, allow_video, state):
     if allow_video and ENABLE_VIDEO and (item.get("video") or item.get("page_video")):
         tmp = tempfile.mkdtemp(prefix="vid")
         try:
-            res = make_video(item, tmp)
+            res = make_video(item, tmp, state)
             if res:
-                path, w, h, dur, sub = res
+                path, w, h, dur, sub, vfp = res
                 cap = build_post(item, title_fa, sum_fa, 1000)
                 if sub:
                     cap = cap.replace(RLM + "🔗", RLM + "🎬 زیرنویس فارسی خودکار\n" + RLM + "🔗", 1)
                 if send_video(path, cap, w, h, dur):
+                    if vfp is not None:
+                        state.setdefault("vid_fp", []).append(list(vfp))
                     return "video"
                 log("sending the video to Telegram failed, falling back to photo/text")
             else:
@@ -2028,6 +2115,10 @@ def selftest():
     # same photo under a different URL is caught by content
     st = {"img_fp": [["abc", 0b1011]]}
     assert img_is_dup(("abc", None), st) and img_is_dup(("zzz", 0b1010), st) and not img_is_dup(("zzz", (1 << 60) | 5), st)
+    # same check, for videos (a shared/reused clip must be caught the same way images are)
+    stv = {"vid_fp": [["vabc", 0b1011]]}
+    assert vid_is_dup(("vabc", None), stv) and vid_is_dup(("vzzz", 0b1010), stv) and not vid_is_dup(("vzzz", (1 << 60) | 5), stv)
+    assert vid_looks_generic("https://cdn.example.com/hero-video.mp4") and not vid_looks_generic("https://cdn.example.com/najaf-flights.mp4")
     log("selftest finished, failures: %d" % bad)
     sys.exit(1 if bad else 0)
 
