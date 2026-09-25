@@ -1030,6 +1030,29 @@ def visible_len(t):
     return len(html.unescape(re.sub(r"<[^>]+>", "", t)))
 
 
+_CH_TAG = None
+
+
+def channel_tag():
+    """@username of the channel this bot posts to (auto-detected from CHANNEL_ID via getChat),
+    so every post carries the channel handle - helps growth when posts get forwarded.
+    Disable with ADD_CHANNEL_TAG=0."""
+    global _CH_TAG
+    if _CH_TAG is not None:
+        return _CH_TAG
+    tag = ""
+    if env("ADD_CHANNEL_TAG", "1") == "1" and CHANNEL_ID and not DRY_RUN:
+        if CHANNEL_ID.startswith("@"):
+            tag = CHANNEL_ID
+        else:
+            j = tg("getChat", dict(chat_id=CHANNEL_ID), retries=1)
+            u = ((j or {}).get("result") or {}).get("username")
+            if u:
+                tag = "@" + u
+    _CH_TAG = tag
+    return tag
+
+
 def build_post(item, title_fa, sum_fa, limit):
     src = "%s (%s)" % (item["src_fa"], TIER_FA[item["tier"]])
     also = "، ".join(item.get("also", [])[:3])
@@ -1044,6 +1067,9 @@ def build_post(item, title_fa, sum_fa, limit):
             lines.append(RLM + "🔁 همچنین در: " + esc(also))
         lines.append(RLM + '🔗 <a href="' + esca(item["link"]) + '">مطالعه‌ی خبر اصلی</a>')
         lines.append(RLM + tags)
+        ch = channel_tag()
+        if ch:
+            lines.append(RLM + "📢 " + esc(ch))
         return "\n".join(lines)
 
     s, t = (sum_fa or "").strip(), title_fa
