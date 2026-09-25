@@ -1,0 +1,707 @@
+# -*- coding: utf-8 -*-
+"""
+growth.py - ابزار رشد کانال از طریق «تبادل معرفی» (همه‌چیز در یک فایل)
+
+اجرا:   python growth.py full    # پیدا کردن کانال + ارسال پیشنهاد + بررسی پاسخ‌ها + پست معرفی + تأیید + گزارش
+        python growth.py light   # فقط بررسی پاسخ‌ها + پست معرفی + تأیید (بدون پیام جدید)
+
+کانال خودت از این‌ها خوانده می‌شود (به همین ترتیب):
+  GROWTH_CHANNEL (مثلاً @my_news)  ->  CHANNEL_ID (همان secret بات اخبار)  ->  پیش‌فرض پروفایل
+پروفایل با GROWTH_PROFILE انتخاب می‌شود: news (پیش‌فرض) یا reels.
+"""
+import asyncio
+import html
+import json
+import os
+import random
+import re
+import sqlite3
+import sys
+import time
+import traceback
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+
+import requests
+
+
+def env(name, default=""):
+    v = os.environ.get(name, "")
+    return v.strip() if v.strip() else default
+
+
+STATE_DIR = env("GROWTH_STATE_DIR", "growth_state")
+DB_PATH = os.path.join(STATE_DIR, "exchanges.db")
+CANDIDATES_FILE = os.path.join(STATE_DIR, "candidates.txt")
+
+MAX_DM_PER_RUN = int(env("GROWTH_MAX_DM", 6))       # حداکثر پیام جدید در هر اجرا
+MAX_DM_PER_DAY = int(env("GROWTH_MAX_DM_DAY", 8))   # سقف روزانه (حتی اگر چند بار اجرا شود)
+MIN_DELAY, MAX_DELAY = 90, 240                      # ثانیه بین پیام‌ها
+MAX_PROMOS_PER_RUN = 2                              # حداکثر پست معرفی در هر اجرا
+REPLY_TIMEOUT_DAYS = 7                              # بعد از این مدت بدون جواب: no_reply
+GRACE_HOURS = 48                                    # مهلت پست متقابل
+MAX_PENDING_CANDIDATES = 40                         # اگر این‌قدر کاندید تماس‌نگرفته داریم، جست‌وجو نکن
+MAX_LOOKUPS_PER_RUN = 40                            # سقف درخواست جزئیات کانال در هر اجرا
+MAX_NEW_CANDIDATES = 25
+
+
+# =====================================================================
+#  پروفایل‌ها
+# =====================================================================
+PROFILES = {
+    "news": {
+        "default_channel": None,   # از CHANNEL_ID خوانده می‌شود
+        "about": "اخبار و تحلیل‌های مرتبط با ایران، ترجمه‌شده از رسانه‌های معتبر جهان به فارسی",
+        "keywords": ["اخبار ایران", "اخبار فوری", "اخبار سیاسی", "تحلیل سیاسی", "اخبار روز",
+                     "اخبار اقتصادی", "اخبار بین الملل", "خبر فوری", "رسانه های خارجی", "اخبار نفت و انرژی"],
+        "min_members": 1000,
+        "max_members": 300000,
+        "pitches": [
+            "سلام، وقتتون بخیر 🌷\nمن کانال «{me}» رو اداره می‌کنم ({about}).\n"
+            "پیشنهاد می‌کنم یه تبادل معرفی داشته باشیم: من کانال شما رو تو کانالم معرفی می‌کنم و شما هم کانال ما رو تو کانالتون.\n"
+            "اگه علاقه‌ای ندارید، بی‌زحمت نادیده بگیرید 🙏",
+            "سلام و درود 👋\nکانال «{me}» رو راه انداختم ({about}).\n"
+            "دوست دارم تبادل معرفی داشته باشیم؛ هر کدوم کانال دیگری رو تو کانال خودمون معرفی کنیم.\n"
+            "اگه موافقید خبر بدید، اگه نه هم مشکلی نیست 🌹",
+            "سلام، خسته نباشید 🌷\nمن ادمین «{me}» هستم ({about}).\n"
+            "تبادل معرفی متقابل با کانال شما برام جالبه. اگه موافقید بگید تا هماهنگ کنیم.\n"
+            "و اگه مناسب نیست، پوزش بابت مزاحمت 🙏",
+        ],
+    },
+    "reels": {
+        "default_channel": "@my_reels_fa",
+        "about": "ویدیوهای پربازدید با زیرنویس فارسی",
+        "keywords": ["طنز فارسی", "کلیپ خنده دار", "انگیزشی فارسی", "کلیپ حیوانات", "ویدیو طنز"],
+        "min_members": 2000,
+        "max_members": 200000,
+        "pitches": [
+            "سلام 👋 وقتتون بخیر\nکانال «{me}» رو اداره می‌کنم ({about}).\n"
+            "پیشنهاد تبادل معرفی دارم: یه پست معرفی از کانال شما تو کانال من می‌ذارم، شما هم یه پست معرفی از من بذارید.\n"
+            "اگه علاقه‌ای ندارید، بی‌زحمت نادیده بگیرید 🙏",
+            "سلام، درود 🌷\nمن ادمین «{me}» هستم ({about}).\n"
+            "تبادل معرفی متقابل می‌کنید؟ هر دو کانال رو تو کانال خودمون معرفی کنیم.\n"
+            "اگه نه، مشکلی نیست 🙏",
+        ],
+    },
+}
+
+
+# =====================================================================
+#  ابزارهای عمومی: Bot API و اطلاع‌رسانی به مالک
+# =====================================================================
+def bot_api(method, **data):
+    token = env("BOT_TOKEN")
+    if not token:
+        return None
+    try:
+        r = requests.post("https://api.telegram.org/bot%s/%s" % (token, method), data=data, timeout=20)
+        return r.json()
+    except Exception as ex:                                        # noqa
+        print("bot api %s failed: %s" % (method, type(ex).__name__))   # عمداً بدون متن خطا (ممکنه توکن داشته باشه)
+        return None
+
+
+def notify(text):
+    """پیام کوتاه به چت خود مالک (اگر OWNER_CHAT_ID تنظیم شده)."""
+    chat = env("OWNER_CHAT_ID")
+    if chat:
+        bot_api("sendMessage", chat_id=chat, text=text, parse_mode="HTML", disable_web_page_preview="true")
+
+
+def resolve_channel(default):
+    explicit = env("GROWTH_CHANNEL")
+    if explicit:
+        return "@" + explicit.lstrip("@"), {}
+    cid = env("CHANNEL_ID")
+    if cid:
+        if cid.startswith("@"):
+            return cid, {}
+        j = bot_api("getChat", chat_id=cid)
+        res = (j or {}).get("result") or {}
+        if res.get("username"):
+            return "@" + res["username"], res
+        raise RuntimeError("کانال شما username عمومی ندارد (یا CHANNEL_ID اشتباه است). "
+                           "برای تبادل، کانال باید عمومی باشد یا GROWTH_CHANNEL را در workflow تنظیم کن.")
+    if default:
+        return default, {}
+    raise RuntimeError("کانال مشخص نیست: CHANNEL_ID یا GROWTH_CHANNEL را تنظیم کن.")
+
+
+def load_cfg():
+    name = env("GROWTH_PROFILE", "news").lower()
+    if name not in PROFILES:
+        raise RuntimeError("پروفایل ناشناخته: %s (news یا reels)" % name)
+    cfg = dict(PROFILES[name])
+    cfg["profile"] = name
+    handle, chat = resolve_channel(cfg.get("default_channel"))
+    cfg["my_handle"] = handle
+    cfg["my_title"] = chat.get("title") or handle
+    cfg["about"] = env("GROWTH_ABOUT", cfg["about"])
+    return cfg
+
+
+async def make_client():
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    client = TelegramClient(StringSession(env("TG_SESSION")), int(env("TG_API_ID", "0")), env("TG_API_HASH"))
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise RuntimeError("TG_SESSION نامعتبر یا منقضی است؛ session_generator.py را دوباره اجرا کن.")
+    return client
+
+
+# =====================================================================
+#  دیتابیس (SQLite)
+#  وضعیت‌ها: contacted | agreed | posted_us | verified | broken |
+#            declined | no_reply | needs_review | failed
+# =====================================================================
+_EXTRA_COLS = {"admin_id": "INTEGER", "promo_msg_id": "INTEGER", "last_seen_msg_id": "INTEGER"}
+
+
+def get_conn():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS exchanges (
+            channel TEXT PRIMARY KEY COLLATE NOCASE,
+            admin_username TEXT,
+            contact_date TEXT,
+            status TEXT DEFAULT 'contacted',
+            our_post_date TEXT,
+            their_post_verified_date TEXT,
+            notes TEXT
+        )""")
+    conn.execute("CREATE TABLE IF NOT EXISTS member_history (date TEXT PRIMARY KEY, member_count INTEGER)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS posted_videos (
+            video_hash TEXT PRIMARY KEY, source_channel TEXT, posted_date TEXT, views INTEGER)""")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(exchanges)")}
+    for col, typ in _EXTRA_COLS.items():
+        if col not in have:
+            conn.execute("ALTER TABLE exchanges ADD COLUMN %s %s" % (col, typ))
+    conn.commit()
+    return conn
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db_all(sql, params=()):
+    with closing(get_conn()) as c:
+        return c.execute(sql, params).fetchall()
+
+
+def db_run(sql, params=()):
+    with closing(get_conn()) as c:
+        c.execute(sql, params)
+        c.commit()
+
+
+def already_contacted(channel):
+    return bool(db_all("SELECT 1 FROM exchanges WHERE channel=?", (channel,)))
+
+
+def admin_contacted(admin_id):
+    return bool(db_all("SELECT 1 FROM exchanges WHERE admin_id=? AND status!='failed'", (admin_id,)))
+
+
+def contacts_today():
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    return db_all("SELECT COUNT(*) FROM exchanges WHERE contact_date>=? AND status!='failed'", (start,))[0][0]
+
+
+def add_contact(channel, admin_username, admin_id=None, status="contacted", notes=""):
+    db_run("INSERT OR IGNORE INTO exchanges (channel, admin_username, admin_id, contact_date, status, notes) "
+           "VALUES (?,?,?,?,?,?)", (channel, admin_username, admin_id, _now(), status, notes))
+
+
+_ALLOWED = {"our_post_date", "their_post_verified_date", "notes", "promo_msg_id", "last_seen_msg_id"}
+
+
+def update_status(channel, status, **fields):
+    sets, vals = ["status=?"], [status]
+    for k, v in fields.items():
+        if k not in _ALLOWED:
+            raise ValueError(k)
+        sets.append("%s=?" % k)
+        vals.append(v)
+    vals.append(channel)
+    db_run("UPDATE exchanges SET %s WHERE channel=?" % ", ".join(sets), vals)
+
+
+def set_last_seen(channel, msg_id):
+    db_run("UPDATE exchanges SET last_seen_msg_id=? WHERE channel=?", (msg_id, channel))
+
+
+def record_member_count(count):
+    today = datetime.now(timezone.utc).date().isoformat()
+    db_run("INSERT OR REPLACE INTO member_history (date, member_count) VALUES (?,?)", (today, count))
+
+
+def member_history(days=8):
+    rows = db_all("SELECT date, member_count FROM member_history ORDER BY date DESC LIMIT ?", (days,))
+    return list(reversed(rows))
+
+
+def is_duplicate(video_hash):
+    return bool(db_all("SELECT 1 FROM posted_videos WHERE video_hash=?", (video_hash,)))
+
+
+def record_posted_video(video_hash, source_channel, views):
+    db_run("INSERT OR IGNORE INTO posted_videos (video_hash, source_channel, posted_date, views) VALUES (?,?,?,?)",
+           (video_hash, source_channel, _now(), views))
+
+
+# =====================================================================
+#  ۱) پیدا کردن کانال‌های هم‌موضوع
+# =====================================================================
+FA_RX = re.compile(r"[\u0600-\u06FF]")
+
+
+def load_candidates():
+    if not os.path.exists(CANDIDATES_FILE):
+        return []
+    out = []
+    with open(CANDIDATES_FILE, encoding="utf-8") as f:
+        for line in f:
+            p = line.split()
+            if p:
+                out.append((p[0], int(p[1]) if len(p) > 1 and p[1].isdigit() else 0))
+    return out
+
+
+async def find_channels(client, cfg):
+    from telethon import errors
+    from telethon.tl.functions.channels import GetFullChannelRequest
+    from telethon.tl.functions.contacts import SearchRequest
+    from telethon.tl.types import Channel
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    cands = load_candidates()
+    pending = sum(1 for h, _ in cands if not already_contacted(h))
+    if pending >= MAX_PENDING_CANDIDATES:
+        print("کاندید تماس‌نگرفته کافی داریم (%d)، جست‌وجو رد شد." % pending)
+        return
+    known = {h.lower() for h, _ in cands}
+    mine = cfg["my_handle"].lower()
+    lookups = found = 0
+
+    for kw in cfg["keywords"]:
+        if lookups >= MAX_LOOKUPS_PER_RUN or found >= MAX_NEW_CANDIDATES:
+            break
+        try:
+            res = await client(SearchRequest(q=kw, limit=30))
+        except errors.FloodWaitError as e:
+            print("FloodWait روی جست‌وجو: %ds" % e.seconds)
+            if e.seconds > 300:
+                break
+            await asyncio.sleep(e.seconds + 1)
+            continue
+        except Exception as e:                                     # noqa
+            print("جست‌وجو ناموفق: %s" % type(e).__name__)
+            continue
+
+        for chat in res.chats:
+            if lookups >= MAX_LOOKUPS_PER_RUN or found >= MAX_NEW_CANDIDATES:
+                break
+            # فقط کانال‌های broadcast عمومی؛ گروه، کانال کلاهبرداری/جعلی/محدود رد می‌شود
+            if not isinstance(chat, Channel) or not chat.broadcast or not chat.username:
+                continue
+            if getattr(chat, "scam", False) or getattr(chat, "fake", False) or getattr(chat, "restricted", False):
+                continue
+            handle = "@" + chat.username
+            if handle.lower() == mine or handle.lower() in known or already_contacted(handle):
+                continue
+            # تعداد ممبر در نتیجهٔ جست‌وجو پر نمی‌شود؛ باید جزئیات کامل کانال گرفته شود
+            lookups += 1
+            try:
+                full = (await client(GetFullChannelRequest(chat))).full_chat
+            except errors.FloodWaitError as e:
+                print("FloodWait روی جزئیات: %ds" % e.seconds)
+                lookups = MAX_LOOKUPS_PER_RUN
+                break
+            except Exception:                                      # noqa
+                continue
+            await asyncio.sleep(random.uniform(2, 4))
+            members = full.participants_count or 0
+            text = (chat.title or "") + " " + (full.about or "")
+            if not FA_RX.search(text):
+                continue                                           # فارسی نیست
+            if not (cfg["min_members"] <= members <= cfg["max_members"]):
+                continue
+            with open(CANDIDATES_FILE, "a", encoding="utf-8") as f:
+                f.write("%s %d\n" % (handle, members))
+            known.add(handle.lower())
+            found += 1
+        await asyncio.sleep(5)
+    print("%d کانال جدید پیدا شد (%d درخواست جزئیات)." % (found, lookups))
+
+
+# =====================================================================
+#  ۲) ارسال پیشنهاد تبادل به ادمین
+# =====================================================================
+async def find_contact(client, entity, handle):
+    """ادمینِ قابل پیام‌دادن (با username). اول ادمین‌های کانال، بعد @آیدی داخل بیو."""
+    from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
+    from telethon.tl.types import ChannelParticipantCreator, ChannelParticipantsAdmins, User
+    try:
+        parts = await client(GetParticipantsRequest(entity, ChannelParticipantsAdmins(), 0, 30, 0))
+        umap = {u.id: u for u in parts.users}
+        order = []
+        for p in parts.participants:
+            u = umap.get(getattr(p, "user_id", None))
+            if u and not u.bot and not u.deleted and u.username:   # username لازم است تا بعداً پیام‌ها خوانده شوند
+                order.append((0 if isinstance(p, ChannelParticipantCreator) else 1, u))
+        order.sort(key=lambda x: x[0])
+        if order:
+            return order[0][1]
+    except Exception as e:                                         # noqa
+        print("لیست ادمین‌ها در دسترس نیست (%s)" % type(e).__name__)
+    try:
+        about = (await client(GetFullChannelRequest(entity))).full_chat.about or ""
+        for m in re.findall(r"@([A-Za-z][A-Za-z0-9_]{4,31})", about):
+            if m.lower() == handle.lstrip("@").lower():
+                continue
+            try:
+                ent = await client.get_entity("@" + m)
+            except Exception:                                      # noqa
+                continue
+            if isinstance(ent, User) and not ent.bot and not ent.deleted and ent.username:
+                return ent
+    except Exception:                                              # noqa
+        pass
+    return None
+
+
+async def already_chatted(client, user):
+    """اگر قبلاً با این آدم پیام رد و بدل شده، دوباره پیام نده (حتی اگر دیتابیس پاک شده باشد)."""
+    try:
+        async for _ in client.iter_messages(user, limit=1):
+            return True
+    except Exception:                                              # noqa
+        return True    # مطمئن نیستیم؛ محتاطانه پیام نده
+    return False
+
+
+async def outreach(client, cfg):
+    from telethon import errors
+    cands = [h for h, _ in load_candidates()]
+    if not cands:
+        print("candidates.txt خالی است.")
+        return
+    budget = min(MAX_DM_PER_RUN, MAX_DM_PER_DAY - contacts_today())
+    if budget <= 0:
+        print("سقف پیام روزانه پر شده.")
+        return
+    sent = 0
+    for handle in cands:
+        if sent >= budget:
+            break
+        if already_contacted(handle):
+            continue
+        try:
+            entity = await client.get_entity(handle)
+        except Exception as e:                                     # noqa
+            add_contact(handle, None, status="failed", notes="entity: " + type(e).__name__)
+            continue
+        admin = await find_contact(client, entity, handle)
+        if not admin:
+            add_contact(handle, None, status="failed", notes="no reachable admin")
+            continue
+        if admin_contacted(admin.id) or await already_chatted(client, admin):
+            add_contact(handle, admin.username, admin.id, status="failed", notes="admin already contacted")
+            continue
+        text = random.choice(cfg["pitches"]).format(me=cfg["my_handle"], about=cfg["about"])
+        try:
+            await client.send_message(admin, text)
+        except (errors.PeerFloodError, errors.FloodWaitError) as e:
+            print("تلگرام محدودیت اسپم اعلام کرد (%s) → توقف." % type(e).__name__)
+            notify("⚠️ تلگرام برای ارسال پیام تبادل محدودیت اعلام کرد؛ ارسال متوقف شد. چند روز صبر کن و GROWTH_MAX_DM را کمتر کن.")
+            break
+        except Exception as e:                                     # noqa
+            add_contact(handle, admin.username, admin.id, status="failed", notes="send: " + type(e).__name__)
+            continue
+        add_contact(handle, admin.username, admin.id)
+        sent += 1
+        print("پیشنهاد تبادل برای %s فرستاده شد." % handle)
+        await asyncio.sleep(random.randint(MIN_DELAY, MAX_DELAY))
+    print("در این اجرا %d پیام تبادل فرستاده شد." % sent)
+
+
+# =====================================================================
+#  ۳) تشخیص پاسخ ادمین + پست معرفی
+# =====================================================================
+def norm(t):
+    t = (t or "").lower()
+    for a, b in (("ي", "ی"), ("ك", "ک"), ("أ", "ا"), ("إ", "ا"), ("ؤ", "و"), ("ة", "ه")):
+        t = t.replace(a, b)
+    t = t.replace("\u200c", " ").replace("\u200f", "").replace("\u200e", "")
+    t = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"(.)\1{2,}", r"\1", t)          # «باشههه» → «باشه»
+    return re.sub(r"\s+", " ", t).strip()
+
+
+DECLINE_PHRASES = [
+    "نه ممنون", "نه متشکرم", "نه مرسی", "متاسفم", "متاسفانه", "نمی خوام", "نمیخوام", "نمی خواهم",
+    "نمی خوایم", "نمیخوایم", "نمی تونم", "نمیتونم", "نمی شه", "نمیشه", "نباشه", "علاقه ای ندارم",
+    "علاقه ای نداریم", "علاقه ندارم", "تبادل نمی کنم", "تبادل نمیکنم", "تبادل نداریم", "تبادل نمی کنیم",
+    "قبول ندارم", "قبول نمی کنم", "قبول نمیکنم", "قبول نیست", "نیازی نیست", "نیازی ندارم", "نیازی نداریم",
+    "فعلا نه", "خیر ممنون", "پیام نده", "پیام ندید", "پیام ندین", "مزاحم نشید",
+    "no thanks", "no thank you", "not interested", "sorry",
+]
+BARE_DECLINE = {"نه", "خیر", "no", "nope", "نچ"}          # فقط در پیام‌های کوتاه
+AGREE_TOKENS = {"باشه", "قبول", "قبوله", "موافقم", "موافق", "اوکی", "اوکیه", "ok", "okay", "حتما",
+                "هماهنگ", "هماهنگیم", "بله", "اره", "آره"}
+AGREE_PHRASES = ["چرا که نه", "انجام میدیم", "انجام می دیم", "انجام میدم", "انجام می دم", "با کمال میل",
+                 "خوشحال میشم", "خوشحال می شم", "مشکلی ندارم", "مشکلی نیست", "اشکالی نداره", "اشکالی ندارد"]
+NEG_AFTER = {"نیست", "نمی", "نمیکنم", "نمیشه", "ندارم", "نداریم", "نه", "نکن"}
+COND_AFTER = {"ولی", "اما", "فقط", "شرط", "به شرط", "اگه", "اگر"}
+
+
+def classify(text):
+    """'agree' | 'decline' | 'unclear' (رد اول بررسی می‌شود؛ «نباشه»، «قبول نیست» و... موافقت حساب نمی‌شود)."""
+    t = norm(text)
+    if not t:
+        return "unclear"
+    toks = t.split()
+    padded = " %s " % t
+    if any((" %s " % p) in padded for p in DECLINE_PHRASES):
+        return "decline"
+    if len(toks) <= 4 and any(x in BARE_DECLINE for x in toks):
+        return "decline"
+    for i, tok in enumerate(toks):
+        if tok in AGREE_TOKENS:
+            window = toks[i + 1:i + 4]
+            if any(w in NEG_AFTER for w in window):
+                return "decline"
+            if any(w in COND_AFTER for w in toks[i + 1:i + 7]):
+                return "unclear"
+            return "agree"
+    if any((" %s " % p) in padded for p in AGREE_PHRASES):
+        return "agree"
+    return "unclear"
+
+
+async def check_replies(client, cfg):
+    rows = db_all("SELECT channel, admin_username, contact_date, last_seen_msg_id FROM exchanges "
+                  "WHERE status='contacted'")
+    now = datetime.now(timezone.utc)
+    for channel, username, contact_date, last_seen in rows:
+        contact_dt = datetime.fromisoformat(contact_date)
+        if not username:
+            continue
+        try:
+            admin = await client.get_entity("@" + username.lstrip("@"))
+        except Exception as e:                                     # noqa
+            print("resolve %s: %s" % (channel, type(e).__name__))
+            continue
+        decision, unclear_texts, newest = None, [], last_seen or 0
+        try:
+            async for msg in client.iter_messages(admin, limit=20):
+                if msg.date.astimezone(timezone.utc) < contact_dt:
+                    break
+                if msg.out or not msg.text:
+                    continue
+                if last_seen and msg.id <= last_seen:
+                    break
+                newest = max(newest, msg.id)
+                verdict = classify(msg.text)
+                if verdict in ("agree", "decline"):
+                    decision = verdict
+                    break
+                unclear_texts.append(msg.text)
+        except Exception as e:                                     # noqa
+            print("خواندن پاسخ %s ناموفق: %s" % (channel, type(e).__name__))
+            continue
+
+        if decision == "agree":
+            update_status(channel, "agreed", last_seen_msg_id=newest)
+            print("%s: موافقت کرد ✅" % channel)
+        elif decision == "decline":
+            update_status(channel, "declined", last_seen_msg_id=newest)
+            print("%s: رد کرد ❌" % channel)
+        elif unclear_texts:
+            set_last_seen(channel, newest)
+            snippet = html.escape(unclear_texts[0][:200])
+            notify("💬 پاسخ نامشخص از ادمین %s (@%s):\n«%s»\nخودت مستقیم جواب بده؛ اگر موافقت کرد، ربات متوجه نمی‌شود مگر پیام بعدی‌اش واضح باشد."
+                   % (html.escape(channel), html.escape(username), snippet))
+        elif now - contact_dt > timedelta(days=REPLY_TIMEOUT_DAYS):
+            update_status(channel, "needs_review" if last_seen else "no_reply")
+            print("%s: مهلت پاسخ تمام شد." % channel)
+
+
+async def _about_of(client, channel):
+    from telethon.tl.functions.channels import GetFullChannelRequest
+    try:
+        full = await client(GetFullChannelRequest(await client.get_entity(channel)))
+        about = (full.full_chat.about or "").strip().split("\n")[0]
+        return full.chats[0].title, about[:160]
+    except Exception:                                              # noqa
+        return None, ""
+
+
+async def post_promos(client, cfg):
+    rows = db_all("SELECT channel, admin_username FROM exchanges WHERE status='agreed'")
+    my = cfg["my_handle"]
+    posted = 0
+    for channel, username in rows:
+        if posted >= MAX_PROMOS_PER_RUN:
+            break
+        title, about = await _about_of(client, channel)
+        if not title:
+            print("اطلاعات %s در دسترس نیست." % channel)
+            continue
+        link = "https://t.me/" + channel.lstrip("@")
+        text = "📢 <b>معرفی کانال</b>\n<a href=\"%s\">%s</a>\n" % (html.escape(link, quote=True), html.escape(title))
+        if about:
+            text += "%s\n" % html.escape(about)
+        text += "\n%s" % html.escape(channel)
+        j = bot_api("sendMessage", chat_id=my, text=text, parse_mode="HTML")
+        if not (j and j.get("ok")):
+            print("پست معرفی %s ناموفق: %s" % (channel, str((j or {}).get("description", ""))[:100]))
+            continue
+        msg_id = j["result"]["message_id"]
+        update_status(channel, "posted_us", our_post_date=_now(), promo_msg_id=msg_id)
+        posted += 1
+        print("%s: پست معرفی گذاشته شد." % channel)
+
+        # به ادمین بگو چی بذاره؛ بدون این پیام او نمی‌داند دقیقاً چه پستی را باید بگذارد
+        our_link = "https://t.me/%s/%s" % (my.lstrip("@"), msg_id)
+        ready = "📢 معرفی کانال\n%s\n%s\n%s" % (cfg["my_title"], cfg["about"], my)
+        follow = ("ممنون که موافقت کردید 🙏\nپست معرفی کانال شما در کانال ما گذاشته شد:\n%s\n\n"
+                  "متن آماده برای گذاشتن در کانال شما (می‌تونید کپی کنید):\n\n%s\n\n"
+                  "اگه چند روز روی کانالتون بمونه خیلی ممنون می‌شم 🌷" % (our_link, ready))
+        try:
+            await client.send_message("@" + username.lstrip("@"), follow)
+        except Exception as e:                                     # noqa
+            notify("⚠️ پست معرفی %s گذاشته شد ولی پیام راهنما به ادمینش نرفت (%s). دستی متن را برایش بفرست."
+                   % (html.escape(channel), type(e).__name__))
+        await asyncio.sleep(random.uniform(20, 60))
+
+
+# =====================================================================
+#  ۴) بررسی اینکه طرف مقابل پست متقابل گذاشته
+# =====================================================================
+async def verify_exchanges(client, cfg):
+    my = cfg["my_handle"].lstrip("@").lower()
+    try:
+        my_id = (await client.get_entity(cfg["my_handle"])).id
+    except Exception:                                              # noqa
+        my_id = None
+    rows = db_all("SELECT channel, contact_date, our_post_date FROM exchanges WHERE status='posted_us'")
+    for channel, contact_date, our_post_date in rows:
+        since = datetime.fromisoformat(contact_date)
+        found = False
+        try:
+            async for msg in client.iter_messages(channel, limit=50):
+                if msg.date.astimezone(timezone.utc) < since:
+                    break
+                text = (msg.text or "").lower()
+                fwd = getattr(getattr(msg, "fwd_from", None), "from_id", None)
+                if my in text or (my_id and getattr(fwd, "channel_id", None) == my_id):
+                    found = True
+                    break
+        except Exception as e:                                     # noqa
+            print("بررسی %s ناموفق: %s" % (channel, type(e).__name__))
+            continue
+        if found:
+            update_status(channel, "verified", their_post_verified_date=_now())
+            print("%s: تأیید شد ✅" % channel)
+            notify("✅ تبادل با %s تأیید شد." % html.escape(channel))
+        elif our_post_date and datetime.now(timezone.utc) - datetime.fromisoformat(our_post_date) > timedelta(hours=GRACE_HOURS):
+            update_status(channel, "broken")
+            print("%s: پست متقابل نگذاشتند ⚠️" % channel)
+            notify("⚠️ %s تا %d ساعت پست متقابل نگذاشت." % (html.escape(channel), GRACE_HOURS))
+
+
+# =====================================================================
+#  ۵) گزارش روزانه
+# =====================================================================
+LABELS = {
+    "contacted": "منتظر پاسخ", "agreed": "موافقت کرده", "posted_us": "پست ما گذاشته شد، منتظر پست آن‌ها",
+    "verified": "تبادل کامل ✅", "broken": "پست متقابل نگذاشتند ⚠️", "declined": "رد کردند",
+    "no_reply": "بی‌پاسخ", "needs_review": "پاسخ نامشخص", "failed": "ارسال ناموفق/بدون ادمین",
+}
+
+
+def news_posts_24h():
+    """تعداد خبرهای ۲۴ ساعت اخیر بات اخبار (اگر state/posted.json در همین ریپو باشد)."""
+    path = env("NEWS_STATE", "state/posted.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            seen = json.load(f).get("title_seen", {})
+        now = time.time()
+        return sum(1 for v in seen.values() if now - float(v) < 86400)
+    except Exception:                                              # noqa
+        return None
+
+
+def daily_report(cfg):
+    my = cfg["my_handle"]
+    j = bot_api("getChatMemberCount", chat_id=my)
+    if not (j and j.get("ok")):
+        print("تعداد ممبر گرفته نشد.")
+        return
+    count = j["result"]
+    record_member_count(count)
+    hist = member_history(days=30)
+    today = datetime.now(timezone.utc).date()
+    prev = [c for d, c in hist if d < today.isoformat()]
+    d_today = count - prev[-1] if prev else 0
+    week_ago = [c for d, c in hist if d <= (today - timedelta(days=7)).isoformat()]
+    base_week = week_ago[-1] if week_ago else (hist[0][1] if hist else count)
+    d_week = count - base_week
+
+    stats = dict(db_all("SELECT status, COUNT(*) FROM exchanges GROUP BY status"))
+    sign = lambda n: ("+%d" % n) if n >= 0 else str(n)                # noqa
+    lines = ["📊 <b>گزارش روزانه %s</b>" % html.escape(my), "ممبر فعلی: %d" % count,
+             "نسبت به آخرین ثبت: %s" % sign(d_today), "هفت روز اخیر: %s" % sign(d_week)]
+    n = news_posts_24h()
+    if n is not None:
+        lines.append("خبرهای ارسال‌شده در ۲۴ ساعت اخیر: %d" % n)
+    lines += ["", "🔄 تبادل‌ها:"]
+    for st, cnt in sorted(stats.items(), key=lambda x: -x[1]):
+        lines.append("  %s: %d" % (LABELS.get(st, st), cnt))
+    notify("\n".join(lines))
+
+
+# =====================================================================
+#  اجرای کامل
+# =====================================================================
+async def _step(name, coro):
+    try:
+        await coro
+    except Exception as ex:                                        # noqa
+        print("مرحلهٔ %s خطا داد:\n%s" % (name, traceback.format_exc()[-500:]))
+        notify("⚠️ مرحلهٔ «%s» در ابزار رشد خطا داد: %s" % (name, html.escape(type(ex).__name__)))
+
+
+async def run_all(mode):
+    cfg = load_cfg()
+    print("profile=%s channel=%s mode=%s" % (cfg["profile"], cfg["my_handle"], mode))
+    client = await make_client()
+    try:
+        if mode == "full":
+            await _step("find_channels", find_channels(client, cfg))
+            await _step("outreach", outreach(client, cfg))
+        await _step("check_replies", check_replies(client, cfg))
+        await _step("post_promos", post_promos(client, cfg))
+        await _step("verify", verify_exchanges(client, cfg))
+    finally:
+        await client.disconnect()
+    if mode == "full":
+        daily_report(cfg)
+
+
+if __name__ == "__main__":
+    mode = (sys.argv[1] if len(sys.argv) > 1 else env("GROWTH_MODE", "full")).lower()
+    if mode not in ("full", "light"):
+        mode = "full"
+    try:
+        asyncio.run(run_all(mode))
+    except Exception as ex:                                        # noqa
+        print("FATAL: %s" % type(ex).__name__)
+        print(str(ex)[:300])
+        sys.exit(1)
