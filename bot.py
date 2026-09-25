@@ -207,8 +207,14 @@ EXTRA_SOURCES = [
      [GNQ % "AFP+Iran", GNQ % "AFP+(Israel+OR+Hormuz+OR+nuclear+OR+Gulf+OR+sanctions)"]),
     (32, "A", "IAEA", "آژانس بین‌المللی انرژی اتمی (منبع رسمی)",
      ["https://www.iaea.org/feeds/topnews", GN % ("iaea.org", "(Iran+OR+safeguards+OR+enrichment)")]),
+    # OFAC retired its own RSS feed in Jan 2025, and it publishes Iran-specific
+    # sanctions news rarely (not daily), so a 1-day Google News window
+    # (like every other source uses) returns nothing most runs. A 7-day
+    # window catches those low-frequency releases; already-posted items are
+    # still filtered out by the normal de-dup/state logic, so this is safe.
     (33, "A", "US Treasury (OFAC)", "خزانه‌داری آمریکا (منبع رسمی)",
-     [GN % ("home.treasury.gov", "(Iran+OR+sanctions)"), GN % ("ofac.treasury.gov", "Iran")]),
+     ["https://news.google.com/rss/search?q=site:home.treasury.gov+(Iran+OR+sanctions)+when:7d&hl=en-US&gl=US&ceid=US:en",
+      "https://news.google.com/rss/search?q=site:ofac.treasury.gov+Iran+when:7d&hl=en-US&gl=US&ceid=US:en"]),
     (34, "B", "Axios", "اکسیوس",
      ["https://api.axios.com/feed/", GN % ("axios.com", IRAN_TOPICS)]),
     (35, "B", "Fox News", "فاکس‌نیوز",
