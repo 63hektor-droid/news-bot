@@ -1,0 +1,64 @@
+name: growth
+
+# مسیر فایل در ریپو:  .github/workflows/growth.yml
+on:
+  schedule:
+    - cron: "30 6 * * *"    # ~۱۰ صبح تهران: کامل (کانال جدید + پیشنهاد تبادل + پاسخ‌ها + گزارش)
+    - cron: "30 15 * * *"   # ~۱۹ تهران: سبک (فقط پاسخ‌ها + پست معرفی + تأیید)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full یا light"
+        default: "full"
+        type: choice
+        options: [full, light]
+
+# جلوگیری از اجرای هم‌زمان (دو اجرا با یک session باعث قطع شدن session می‌شود)
+concurrency:
+  group: growth
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  growth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
+      TG_SESSION: ${{ secrets.TG_SESSION }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHANNEL_ID: ${{ secrets.CHANNEL_ID }}          # همان secret بات اخبار؛ کانال از روی آن خودکار پیدا می‌شود
+      OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+      GROWTH_PROFILE: news                           # برای ریپوی ریلز: reels
+      GROWTH_MODE: ${{ github.event.inputs.mode || (github.event.schedule == '30 15 * * *' && 'light' || 'full') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-growth.txt
+
+      - run: pip install -r requirements-growth.txt
+
+      # دیتابیس تبادل‌ها + لیست کاندیدها (خصوصی؛ داخل ریپوی عمومی commit نمی‌شود)
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: growth_state
+          key: growth-state-${{ github.run_id }}
+          restore-keys: growth-state-
+
+      - name: Run growth
+        run: python growth.py "$GROWTH_MODE"
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: growth_state
+          key: growth-state-${{ github.run_id }}
