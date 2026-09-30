@@ -11,6 +11,10 @@ Every run:
   5. posts them to the Telegram channel: text, or photo, or video with
      Persian burned-in subtitles (Whisper + free translator)
 
+Videos are only attached when they are verified to belong to THAT story
+(title/description match, or spoken-English match, or a video that comes
+directly from the story's own RSS entry / og:video tag).
+
 Offline self test:  python bot.py selftest
 Dry run (no posting): DRY_RUN=1 python bot.py
 """
@@ -163,10 +167,8 @@ def build_terms():
             add(t, 3, "politics")
     for t in data.ORGANIZATIONS.replace("\n", ",").split(","):
         add(t, 3, "org")
-    # Generic words that data.py lists as if they were uniquely Iranian (a "pension
-    # fund" or the "Agricultural Bank of China" is not Iran news; North Korea also has a
-    # "supreme leader"; shiraz is a wine). Downgraded to weak (weight 1) here so that
-    # data.py needs no edit: they now only count together with a real Iran term.
+    # Generic words that data.py lists as if they were uniquely Iranian are
+    # downgraded to weak (weight 1): they only count together with a real Iran term.
     for t in WEAKEN:
         if t in best:
             best[t] = (1, best[t][1])
@@ -207,11 +209,8 @@ EXTRA_SOURCES = [
      [GNQ % "AFP+Iran", GNQ % "AFP+(Israel+OR+Hormuz+OR+nuclear+OR+Gulf+OR+sanctions)"]),
     (32, "A", "IAEA", "آژانس بین‌المللی انرژی اتمی (منبع رسمی)",
      ["https://www.iaea.org/feeds/topnews", GN % ("iaea.org", "(Iran+OR+safeguards+OR+enrichment)")]),
-    # OFAC retired its own RSS feed in Jan 2025, and it publishes Iran-specific
-    # sanctions news rarely (not daily), so a 1-day Google News window
-    # (like every other source uses) returns nothing most runs. A 7-day
-    # window catches those low-frequency releases; already-posted items are
-    # still filtered out by the normal de-dup/state logic, so this is safe.
+    # OFAC retired its own RSS feed in Jan 2025 and publishes Iran items rarely,
+    # so a 7-day window is used; already-posted items are filtered by the normal de-dup.
     (33, "A", "US Treasury (OFAC)", "خزانه‌داری آمریکا (منبع رسمی)",
      ["https://news.google.com/rss/search?q=site:home.treasury.gov+(Iran+OR+sanctions)+when:7d&hl=en-US&gl=US&ceid=US:en",
       "https://news.google.com/rss/search?q=site:ofac.treasury.gov+Iran+when:7d&hl=en-US&gl=US&ceid=US:en"]),
@@ -288,10 +287,8 @@ def toks(title):
     return {w[:6] for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 3 and w not in STOP}
 
 
-# query/fragment params that don't change what article a link points to, but
-# vary between fetches of the same story (analytics, sharing, session ids) -
-# left un-stripped, they defeated exact-URL duplicate detection and were a
-# real source of the same story getting posted more than once.
+# query params that don't change what article a link points to but vary
+# between fetches of the same story (analytics, sharing, session ids).
 TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
     "utm_id", "utm_name", "utm_social", "utm_social-type",
@@ -331,11 +328,7 @@ def clean_text(s):
     s = re.sub(r"</?[A-Za-z][^>]*>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"(The post .{0,200} appeared first on .{0,80}\.?)$", "", s).strip()
-    # some feeds (WordPress-based excerpts: DW, Euronews, Al-Monitor, etc.) append a
-    # "Continue reading" / "Read more" link after the truncated summary; once HTML
-    # tags are stripped above, its link text is left dangling as plain text, and the
-    # translator turns it into a Persian "ادامه مطلب" that promises content that
-    # was never actually included - strip it (and any trailing "[…]" ellipsis marker)
+    # strip dangling "Continue reading" / "Read more" link text and a trailing "[…]"
     s = re.sub(
         r"\s*[\[\(]?\s*(?:continue reading|read more|read the full (?:article|story)|"
         r"full story|click here|see more|the post continues|more\s*[»→>]{0,2})"
@@ -361,9 +354,8 @@ def split_sentences(text):
 
 
 def trim_complete(s, maxlen=900):
-    """Keep WHOLE sentences only. RSS excerpts are often cut mid-sentence
-    ("... said that the"); translating such a fragment gives Persian with no
-    verb (the verb comes last in Persian), so the unfinished tail is dropped."""
+    """Keep WHOLE sentences only (RSS excerpts are often cut mid-sentence;
+    a fragment translates into Persian with no verb)."""
     out = ""
     for x in split_sentences(s):
         cand = (out + " " + x).strip()
@@ -404,8 +396,7 @@ def entry_media(e):
 
 
 # Generic text that Google News (and bot-wall / consent / error pages) put in the
-# description of a page instead of a real article summary. If one of these slips
-# through, the same sentence gets posted under many different news items.
+# description of a page instead of a real article summary.
 _BOILERPLATE = (
     "comprehensive, up-to-date news coverage",
     "comprehensive up-to-date news coverage",
@@ -452,7 +443,6 @@ def _gn_decode(url):
     if not m:
         return ""
     art_id = m.group(1)
-    # old-style ids embed the URL directly in the base64 payload
     try:
         raw = base64.urlsafe_b64decode(art_id + "=" * (-len(art_id) % 4)).decode("latin1")
         mm = re.search(r"https?://[^\x00-\x20\"<>]+", raw)
@@ -485,13 +475,8 @@ def _gn_decode(url):
 
 
 def resolve_gnews_link(url):
-    """Google News RSS article links are opaque, per-fetch redirect tokens - the
-    exact same story can get a different link every time the feed is polled,
-    which defeats the URL-based duplicate check in state['urls'] and was
-    letting Reuters/AP/France24/Times of Israel items (all routed through
-    Google News) get posted again verbatim. Follow the redirect once to the
-    real publisher URL, which is stable across fetches - and a better link
-    for readers than a news.google.com redirect page."""
+    """Google News RSS links are per-fetch redirect tokens; follow them once to
+    the stable publisher URL (needed for URL de-dup and better for readers)."""
     import requests
     try:
         r = requests.head(url, headers={"User-Agent": UA}, timeout=8, allow_redirects=True)
@@ -553,11 +538,7 @@ def fetch_feed(src, url):
                 t = datetime.fromtimestamp(calendar.timegm(e[k]), tz=timezone.utc)
                 break
         if t is None:
-            # no real publish/update time from the feed - defaulting to
-            # "now" here used to make the same-day (Tehran) filter a no-op
-            # for these entries, letting undated items through regardless
-            # of their actual age. Skip instead: "definitely today" can't
-            # be confirmed without a real timestamp.
+            # no real timestamp -> "definitely today" cannot be confirmed: skip
             continue
         img, vid = entry_media(e)
         page_video = (bool(re.search(r"/videos?/|/video-|/watch", link)) and not gnews
@@ -570,21 +551,19 @@ def fetch_feed(src, url):
 
 
 def fetch_page_summary(link, title=""):
-    """Google-News feeds (Reuters, AP, France 24, Times of Israel, Haaretz) carry a
-    headline only, so those posts had no body text. Read the article page and take
-    its description (og:description / meta description, else the first real
-    paragraphs). Returns whole sentences only, or "" if the site blocks us or the
-    page is not the real article (Google page, consent wall, generic boilerplate)."""
+    """Google-News feeds carry a headline only. Read the article page and take its
+    description (og/meta description, else first real paragraphs). Whole sentences
+    only, or "" if blocked / not the real article / boilerplate."""
     import requests
     from bs4 import BeautifulSoup
-    if not link or _is_google_host(link):        # never scrape a Google page as if it were the article
+    if not link or _is_google_host(link):
         return ""
     try:
         r = requests.get(link, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
                          timeout=12)
         if r.status_code != 200 or "html" not in r.headers.get("content-type", "html"):
             return ""
-        if _is_google_host(r.url or ""):           # redirected to Google's page, not the article
+        if _is_google_host(r.url or ""):
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
         cands = []
@@ -642,16 +621,9 @@ def fetch_all(sources):
 #  Selection
 # =====================================================================
 def common_words(old, min_frac=0.12):
-    """Words that show up in a large fraction of *recently posted* titles
-    are generic to this feed's beat, not evidence of "same story" - this
-    bot only covers Iran/Israel/Gaza-region news, so words like "israel",
-    "gaza", "strike", "says" recur in nearly every headline. Matching on
-    them was treating unrelated stories that merely share the topic as
-    duplicates of each other and of weeks of accumulated history - which
-    is how a whole day's worth of genuinely new stories (30 relevant
-    items) ended up with 0 surviving de-dup in one run. Strip these out
-    before the similarity check; only words specific enough to actually
-    identify one story (names, places, unusual nouns) should count."""
+    """Words that appear in a large fraction of recently posted titles are generic
+    to this feed's beat (israel, gaza, strike, ...), not evidence of "same story".
+    They are stripped before the similarity check."""
     if not old:
         return set()
     freq = Counter()
@@ -670,10 +642,10 @@ def select(items, state):
     today_ir = now.astimezone(TEHRAN).date()
     pool = []
     n_seen = n_future = n_notoday = 0
-    near_misses = []   # (pts, strong, medium, title) for items that scored but didn't pass
+    near_misses = []
     for it in items:
         age = (now - it["time"]).total_seconds() / 3600.0
-        if age < -1:                                   # clock-skew / future timestamp
+        if age < -1:
             n_future += 1
             continue
         if it["time"].astimezone(TEHRAN).date() != today_ir:   # only today's news (Iran time)
@@ -685,9 +657,8 @@ def select(items, state):
                 near_misses.append((a["pts"], a["strong"], a["medium"], it["title"]))
             continue
         if not it["summary"] and len(it["title"].split()) < 4:
-            continue                       # a bare name/label like "Masoud Pezeshkian" is not a news item
-        # only resolve the (few) items that actually made it past scoring - resolving
-        # every raw item would mean hundreds of extra requests every run
+            continue
+        # resolve Google News links only for items that passed scoring
         if "news.google.com" in it["link"]:
             it["link"] = normalize_link(resolve_gnews_link(it["link"]))
         if it["link"] in seen:
@@ -770,9 +741,7 @@ _ARGOS_READY = False
 
 
 def _argos_init():
-    """Download + install the en->fa Argos model once (cached for the rest
-    of this process). Runs entirely offline once installed - no per-request
-    network call, so it can never be rate-limited."""
+    """Download + install the en->fa Argos model once (offline afterwards)."""
     global _ARGOS_READY
     if _ARGOS_READY:
         return
@@ -797,12 +766,8 @@ def _argos(text):
 
 
 def _looks_translated(out):
-    """A cheap accuracy check: catches the case where a backend returns
-    ok=True with the source text basically unchanged (rate-limited/broken
-    endpoints do this silently rather than raising) - that used to slip
-    through as a "successful" translation that was actually still
-    English. Short strings (a name, an acronym) can legitimately stay
-    mostly Latin, so only flag longer output that's still majority Latin."""
+    """Cheap accuracy check: catches a backend returning ok with the source text
+    basically unchanged. Short strings may legitimately stay Latin."""
     if not out or not out.strip():
         return False
     if len(out) < 15:
@@ -819,9 +784,7 @@ _TR_CACHE = {}
 
 
 def _gt(text):
-    """Memoised wrapper: the same chunk is often translated twice (glossary
-    retry, same sentence in title and summary) - never spend a rate-limited
-    request on it again within one run."""
+    """Memoised wrapper: never spend a rate-limited request twice on the same chunk."""
     hit = _TR_CACHE.get(text)
     if hit is not None:
         return hit
@@ -835,8 +798,7 @@ def _gt_uncached(text):
     from deep_translator import MyMemoryTranslator, GoogleTranslator
     import random
     last = None
-    # 0) Google - most fluent free option. After ONE 429 it is switched off for
-    #    10 minutes so the run never wastes minutes on doomed retries.
+    # 0) Google - most fluent free option; after ONE 429 it is off for 10 minutes.
     if time.time() >= _GOOGLE_DEAD_UNTIL:
         try:
             time.sleep(0.3 + random.uniform(0, 0.4))
@@ -853,7 +815,7 @@ def _gt_uncached(text):
                 log("Google rate-limited -> disabled for 10 min, using MyMemory/Argos")
             else:
                 log("Google failed: %s" % str(ex)[:150])
-    # 1) LibreTranslate - only if mirrors are configured (public ones are dead/keyed)
+    # 1) LibreTranslate - only if mirrors are configured
     if LIBRE_MIRRORS:
         try:
             out = _libre(text)
@@ -888,38 +850,28 @@ _FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 
 def fix_fa(s):
-    s = _unesc(s)                      # &quot; / &#39; some translators return -> real characters
+    s = _unesc(s)
     s = s.replace("ي", "ی").replace("ك", "ک")
-    # Persian punctuation marks instead of the Latin ones free translators
-    # often leave behind (real "رعایت نگارش فارسی" issue, not cosmetic)
     s = re.sub(r"(?<=[آ-ی۰-۹])\s*\?", "؟", s)
     s = re.sub(r"(?<=[آ-ی۰-۹])\s*;", "؛", s)
-    # a "," only turns into "،" when it's between/after Persian text, not
-    # inside a number like 12,000 or a still-Latin abbreviation
     s = re.sub(r"(?<=[آ-ی])\s*,\s*", "، ", s)
     s = re.sub(r"\s+([،؛:!؟.])", r"\1", s)
-    # straight double quotes -> paired Persian guillemets, alternating
-    # open/close so a translated quote reads as Persian typography instead
-    # of the Latin " the translators leave behind
+    # straight double quotes -> paired Persian guillemets
     _q = {"n": 0}
 
     def _quote(_m):
         _q["n"] += 1
         return "«" if _q["n"] % 2 else "»"
     s = re.sub(r'"', _quote, s)
-    # Persian digits, but never inside a URL/link (leave those untouched)
+    # Persian digits, but never inside a URL
     parts = re.split(r"(https?://\S+)", s)
     for i in range(0, len(parts), 2):
         parts[i] = re.sub(r"\d+", lambda m: m.group(0).translate(_FA_DIGITS), parts[i])
     s = "".join(parts)
-    # percent sign glued to its number with no space, Persian-style, and
-    # written as ٪ rather than the Latin %
     s = re.sub(r"(?<=[۰-۹])\s*%", "٪", s)
-    # one space after sentence/clause punctuation when text runs on without one
     s = re.sub(r"([،؛:؟!])(?=[آ-یA-Za-z0-9])", r"\1 ", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
-    # proper Persian half-space (ZWNJ) in common compounds, instead of the
-    # full space free translators usually leave (bad Persian typography)
+    # proper Persian half-space (ZWNJ) in common compounds
     s = re.sub(r"\b(می|نمی)\s+(?=[آ-ی])", "\\1\u200c", s)
     s = re.sub(r"(?<=[آ-ی])\s+(ها|های)\b", "\u200c\\1", s)
     s = re.sub(r"(?<=[آ-ی])\s+(تر|ترین)\b", "\u200c\\1", s)
@@ -928,9 +880,8 @@ def fix_fa(s):
 
 
 def _chunks(text, maxlen=280):
-    """Group whole sentences into pieces of at most ~maxlen chars. Translating
-    sentence-sized pieces (instead of one long blob) stops the free engines
-    from dropping clauses - and with them the verb."""
+    """Group whole sentences into pieces of at most ~maxlen chars so the free
+    engines don't drop clauses (and with them the verb)."""
     out, cur = [], ""
     for s in split_sentences(text):
         if cur and len(cur) + 1 + len(s) > maxlen:
@@ -975,9 +926,6 @@ def _translate_chunk(text, translator=None):
     if res is None:
         res = translator(text)
     elif _too_short(text, res):
-        # the placeholders can make an engine give up on the rest of the
-        # sentence; if the result is suspiciously short, compare with a
-        # plain translation and keep the fuller one
         log("translation looks truncated, retrying without glossary")
         alt = translator(text)
         if len(alt.split()) > len(res.split()):
@@ -994,15 +942,12 @@ def translate(text, translator=None):
     return fix_fa(" ".join(o.strip() for o in outs if o and o.strip()))
 
 
-# Persian renderings of the Google News boilerplate ("پوشش جامع و به‌روز اخبار ... گوگل نیوز").
-# Last safety net in case the English check missed it: such a summary is dropped.
 _FA_BOILERPLATE = ("گوگل نیوز", "گوگل‌نیوز", "گوگل نیوز", "پوشش جامع و به‌روز", "پوشش جامع و بهروز",
                    "پوشش خبری جامع و به‌روز", "پوشش خبری جامع و بهروز")
 
 
 def _fa_is_boilerplate(s):
-    s = (s or "").replace("\u200c", "‌")
-    flat = s.replace("\u200c", "")
+    flat = (s or "").replace("\u200c", "")
     return any(b.replace("\u200c", "") in flat for b in _FA_BOILERPLATE)
 
 
@@ -1040,8 +985,7 @@ _CH_TAG = None
 
 
 def channel_tag():
-    """@username of the channel this bot posts to (auto-detected from CHANNEL_ID via getChat),
-    so every post carries the channel handle - helps growth when posts get forwarded.
+    """@username of the channel (auto-detected via getChat) appended to every post.
     Disable with ADD_CHANNEL_TAG=0."""
     global _CH_TAG
     if _CH_TAG is not None:
@@ -1085,8 +1029,7 @@ def build_post(item, title_fa, sum_fa, limit):
     while visible_len(assemble(t, s)) > limit and guard < 40:
         guard += 1
         if s:
-            # drop whole sentences from the end - never cut in the middle of
-            # one (a Persian sentence cut mid-way loses its verb)
+            # drop whole sentences from the end - never cut mid-sentence
             parts = re.split(r"(?<=[.!؟?])\s+", s)
             s = " ".join(parts[:-1]) if len(parts) > 1 else ""
         else:
@@ -1113,12 +1056,6 @@ def og_image(url):
 
 
 # ---- image validation ------------------------------------------------
-# Goal: never attach a picture that isn't really the specific photo for
-# that specific story - no generic site logos/icons, no tiny placeholder
-# pixels, no broken links. Every candidate image (whether it came from the
-# RSS entry or was scraped from the article page) is checked here before
-# it's allowed to be posted; a candidate that fails is simply skipped and
-# the next one is tried, so a bad match never silently goes out.
 GENERIC_IMG_PAT = re.compile(
     r"(logo|sprite|placeholder|default[-_]?image|avatar|favicon|"
     r"blank\.gif|spacer|1x1|pixel\.gif|icon[-_]|masthead|site-image)",
@@ -1145,7 +1082,7 @@ def img_ok(url):
             if not ctype.startswith("image/") or "svg" in ctype:
                 return False
             clen = int(r.headers.get("Content-Length") or 0)
-            if clen and clen < 8000:          # icons/logos are typically tiny
+            if clen and clen < 8000:
                 return False
             chunk = r.raw.read(262144, decode_content=True)
             if len(chunk) < 8000 and not clen:
@@ -1154,10 +1091,10 @@ def img_ok(url):
                 from PIL import Image
                 import io
                 w, h = Image.open(io.BytesIO(chunk)).size
-                if w < 300 or h < 200:        # too small to be a real article photo
+                if w < 300 or h < 200:
                     return False
             except Exception:                                    # noqa
-                pass                          # Pillow unavailable/undecodable header - fall back to size checks above
+                pass
             return True
         finally:
             r.close()
@@ -1171,8 +1108,7 @@ FPCACHE = {}
 
 
 def norm_img(url):
-    """Netloc + path + the query parameters that actually identify the picture
-    (size/quality/cache-buster parameters are ignored)."""
+    """Netloc + path + the query parameters that actually identify the picture."""
     try:
         p = urlsplit(url)
         q = sorted((k, v) for k, v in parse_qsl(p.query) if k.lower() not in _IMG_NOISE)
@@ -1182,9 +1118,7 @@ def norm_img(url):
 
 
 def img_fp(url):
-    """Content fingerprint of a picture: (sha1 of the bytes, 64-bit dHash).
-    The same photo served under different URLs/sizes gets the same/similar
-    fingerprint, which the URL comparison alone could never catch."""
+    """Content fingerprint of a picture: (sha1 of the bytes, 64-bit dHash)."""
     try:
         import requests
         import hashlib
@@ -1230,33 +1164,55 @@ def img_is_dup(fp, state):
 
 
 # ---- video validation --------------------------------------------------
-# Mirrors the image validation above: a video attached to a post must really
-# belong to THAT story. Two failure modes were seen: (1) a site-wide "hero"/
-# "trending" video widget that's embedded on many unrelated article pages and
-# gets picked up as if it were the article's own video, and (2) yt-dlp's
-# generic-page fallback grabbing an unrelated player (an ad, a "related
-# videos" reel) from a page that has more than one video embedded. Neither
-# is caught by URL inspection alone, so - exactly like images - every video
-# actually downloaded is content-fingerprinted and checked against every
-# video already posted for a *different* story; a repeat is rejected and the
-# next candidate is tried instead.
+# A video attached to a post must really belong to THAT story. Article pages
+# often embed unrelated players (sidebar "trending/related videos", ads) and
+# the downloader used to grab those. Three layers now protect against it:
+#   1. duplicate-clip check (fingerprint, as before)
+#   2. relevance check: the video's own title/description (YouTube etc.) or
+#      its spoken English (Whisper) must share words with the story
+#   3. a video whose relevance cannot be checked (silent, no title) is only
+#      accepted if it came straight from the story's own RSS entry or its
+#      og:video tag; otherwise it is rejected and the bot falls back to
+#      photo/text.
 GENERIC_VIDEO_PAT = re.compile(
     r"(sponsor|advert|promo|trailer|stinger|bumper|ident|loop|placeholder|"
     r"generic|default[-_]?video|site[-_]?video|masthead|hero[-_]?video)",
     re.I,
 )
 
+# words too generic for this feed to prove a video matches the story
+_VGENERIC = {"iran", "irania", "tehran", "israel", "gaza", "world", "state", "video",
+             "news", "says", "watch", "live", "breaking", "latest", "today"}
+
+# og:video URLs found by find_video_urls (these are the page's own main video)
+OG_URLS = set()
+
 
 def vid_looks_generic(url):
     return bool(url) and bool(GENERIC_VIDEO_PAT.search(url))
 
 
+def story_words(*texts):
+    out = set()
+    for t in texts:
+        out |= {w[:6] for w in re.findall(r"[a-z0-9]+", (t or "").lower())
+                if len(w) > 3 and w not in STOP}
+    return out - _VGENERIC
+
+
+def video_relates(item, vtext, min_hit=1):
+    """True if the video's text (title/description or transcript) shares enough
+    distinctive words with the story's title+summary."""
+    sw = story_words(item.get("title"), item.get("summary"))
+    hit = sw & story_words(vtext)
+    need = max(1, min(min_hit, len(sw) // 3))
+    log("video relevance: %d shared word(s) %s (need %d)" % (len(hit), sorted(hit)[:6], need))
+    return len(hit) >= need
+
+
 def vid_fp(path):
-    """Content fingerprint of a video file: sha1 of a chunk of the encoded
-    bytes plus a coarse perceptual hash of the first decoded frame. Cheap
-    (no full decode) but enough to catch the same physical clip being
-    reused - whether served from the same URL again or re-encoded by a
-    different article page."""
+    """Content fingerprint of a video file: sha1 of a chunk of the bytes plus a
+    coarse perceptual hash of an early frame."""
     try:
         import hashlib
         with open(path, "rb") as f:
@@ -1302,10 +1258,7 @@ def vid_is_dup(fp, state):
 
 def image_candidates(item, state):
     """Yield validated image URLs for this specific item, best first: the
-    RSS-supplied image, then the og:image of the item's own article page.
-    A candidate is skipped when (a) its URL was used before, (b) it is
-    unreachable/too small/a logo, or (c) its CONTENT matches a picture already
-    posted for another story (same photo under a different URL)."""
+    RSS-supplied image, then the og:image of the item's own article page."""
     seen = {norm_img(u) for u in state.get("images", [])}
 
     def usable(u):
@@ -1356,15 +1309,14 @@ def send_video(path, caption, w, h, dur):
 
 
 # =====================================================================
-#  Video: download -> Whisper -> Persian subtitles -> burn with ffmpeg
+#  Video: download -> verify -> Whisper -> Persian subtitles -> burn
 # =====================================================================
 def run(cmd, timeout):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 def ensure_python_deps():
-    """Install yt-dlp / faster-whisper on the fly when the workflow does not
-    provide them, so replacing bot.py alone is enough."""
+    """Install yt-dlp / faster-whisper on the fly when the workflow does not provide them."""
     if not ENABLE_VIDEO:
         return
     for mod, pkg in (("yt_dlp", "yt-dlp"), ("faster_whisper", "faster-whisper")):
@@ -1417,9 +1369,7 @@ _TOOLS_FONT = None
 
 
 def ensure_tools():
-    """Memoised + locked wrapper. video_preflight() starts this in a background
-    thread at the beginning of the run (ffmpeg/fonts install takes ~30-60 s), so
-    it overlaps with feed fetching instead of eating the video time budget."""
+    """Memoised + locked wrapper (runs in a background thread from video_preflight)."""
     global _TOOLS_DONE, _TOOLS_FONT
     with _TOOLS_LOCK:
         if not _TOOLS_DONE:
@@ -1431,11 +1381,9 @@ def ensure_tools():
 
 
 def _ensure_tools():
-    """Returns the Persian font family to burn subtitles with, or None if
-    ffmpeg or a real Persian font couldn't be made available. Falling back
-    to a non-Persian font (e.g. DejaVu Sans) would burn broken/undisplayable
-    text into the video, which is worse than no subtitles - so the caller
-    must skip burning entirely when this returns None."""
+    """Returns the Persian font family for subtitles, or None if ffmpeg or a real
+    Persian font is unavailable (burning a non-Persian font would produce
+    unreadable text, so the caller then skips subtitles)."""
     if not shutil.which("ffmpeg"):
         log("installing ffmpeg ...")
         run(["bash", "-c", "sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg"], 240)
@@ -1483,12 +1431,14 @@ def download(url, path):
 
 
 def ytdlp_download(url, tmp):
+    """Returns (file_path, video_text). video_text = the video's own title +
+    description as reported by the site (used to verify it matches the story)."""
     try:
         import yt_dlp
     except Exception:                                            # noqa
         log("ERROR: yt-dlp is NOT installed - videos embedded in article pages can never be fetched. "
             "Add 'yt-dlp' to the pip install step of the workflow.")
-        return None
+        return None, ""
     sub = tempfile.mkdtemp(dir=tmp)
     opts = {"outtmpl": os.path.join(sub, "yt.%(ext)s"), "quiet": True, "no_warnings": True, "noplaylist": True,
             "socket_timeout": 20, "retries": 3, "max_filesize": MAX_VIDEO_MB * 1024 * 1024,
@@ -1503,18 +1453,22 @@ def ytdlp_download(url, tmp):
         with open(cpath, "w", encoding="utf-8") as f:
             f.write(cookies)
         opts["cookiefile"] = cpath
+    vtext = ""
     try:
         with yt_dlp.YoutubeDL(opts) as y:
-            y.download([url])
+            inf = y.extract_info(url, download=True) or {}
+            if inf.get("entries"):
+                inf = next(iter(inf["entries"]), None) or {}
+            vtext = ((inf.get("title") or "") + " " + (inf.get("description") or "")[:500]).strip()
     except Exception as ex:                                      # noqa
         log("yt-dlp failed for %s: %s" % (url[:80], str(ex)[:300]))
-        return None
+        return None, ""
     files = [os.path.join(sub, f) for f in os.listdir(sub)
              if not f.endswith((".part", ".ytdl", ".json", ".txt"))]
     if not files:
         log("yt-dlp finished but produced no file for", url[:80])
-        return None
-    return max(files, key=os.path.getsize)
+        return None, ""
+    return max(files, key=os.path.getsize), vtext
 
 
 def probe(path):
@@ -1574,10 +1528,9 @@ def build_ass(segs, w, h, font, path):
 
 
 def find_video_urls(link):
-    """Look inside the article page for real video sources. RSS entries almost
-    never carry a video enclosure and most video-led articles have no
-    '/video/' in the URL; they embed a player. Returns candidate URLs (best
-    first) for download()/yt-dlp; [] when the page has no video."""
+    """Look inside the article page for real video sources. Returns candidate URLs
+    (best first) for download()/yt-dlp; [] when the page has no video. The page's
+    og:video URLs are remembered in OG_URLS (they are the article's own main video)."""
     try:
         import requests
         r = requests.get(link, headers={"User-Agent": UA}, timeout=15)
@@ -1599,7 +1552,11 @@ def find_video_urls(link):
                 r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:video(?::secure_url|:url)?["\']',
                 r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)'):
         for m in re.finditer(pat, body, re.I):
-            add(m.group(1))
+            u = html.unescape(m.group(1).strip())
+            if u.startswith("//"):
+                u = "https:" + u
+            OG_URLS.add(u)
+            add(u)
     for m in re.finditer(r'<(?:video|source)[^>]+src=["\']([^"\']+\.(?:mp4|m4v|mov|webm|m3u8)[^"\']*)', body, re.I):
         add(m.group(1))
     for m in re.finditer(r'youtube(?:-nocookie)?\.com/embed/([\w-]{11})', body, re.I):
@@ -1630,11 +1587,11 @@ def _scan_video(item):
 
 
 def fetch_video_source(item, tmp, state):
-    """Try each candidate until one is a real, playable, short-enough video
-    that isn't a duplicate of a video already posted for a DIFFERENT story
-    (a site-wide promo/hero video reused across many article pages, or the
-    same clip yt-dlp's generic extractor grabbed for an earlier item).
-    Returns (path, (w, h, dur, has_audio, vcodec), fp) or None."""
+    """Try each candidate until one is a real, playable, short-enough video that
+    (a) is not a duplicate of a clip already posted for another story and
+    (b) is not clearly about something else (title/description check).
+    Returns (path, (w, h, dur, has_audio, vcodec), fp, video_text, trusted) or None.
+    `trusted` = the URL came straight from the story's own RSS entry or og:video tag."""
     cands = []
     for u in [item.get("video")] + list(item.get("vurls") or []):
         if u and u not in cands and not vid_looks_generic(u):
@@ -1642,7 +1599,7 @@ def fetch_video_source(item, tmp, state):
     if item.get("page_video") and item["link"] not in cands:
         cands.append(item["link"])
     for n, u in enumerate(cands[:4]):
-        p = None
+        p, vtext = None, ""
         m = re.search(r"\.(mp4|m4v|mov|webm)(?:\?|$)", u, re.I)
         if m or u == item.get("video"):
             ext = m.group(1).lower() if m else "mp4"
@@ -1650,7 +1607,10 @@ def fetch_video_source(item, tmp, state):
             if not download(u, p):
                 p = None
         if not p and not m:
-            p = ytdlp_download(u, tmp)
+            p, vtext = ytdlp_download(u, tmp)
+            if u == item["link"]:
+                vtext = ""     # generic extractor on the article page returns the ARTICLE's title,
+                               # which would "verify" any video on it - never trust that
         if not p:
             continue
         info = probe(p)
@@ -1665,13 +1625,16 @@ def fetch_video_source(item, tmp, state):
         if fp is not None and vid_is_dup(fp, state):
             log("skipping video, same clip already used for another story:", u[:90])
             continue
-        return p, info, fp
+        if vtext and not video_relates(item, vtext, 1):
+            log("skipping video, its title is about something else (%s): %s" % (vtext[:70], u[:80]))
+            continue
+        trusted = (u == item.get("video")) or (u in OG_URLS)
+        return p, info, fp, vtext, trusted
     return None
 
 
 def _ensure_mp4(tmp, src, vcodec):
-    """Telegram plays mp4/h264/aac (<50MB) reliably. Re-encode anything else
-    (webm, hevc, av1, ...) or anything too large. None if that is impossible."""
+    """Telegram plays mp4/h264/aac (<50MB) reliably. Re-encode anything else."""
     limit = 49 * 1024 * 1024
     if src.lower().endswith(".mp4") and vcodec == "h264" and os.path.getsize(src) < limit:
         return src
@@ -1687,27 +1650,32 @@ def _ensure_mp4(tmp, src, vcodec):
 
 
 def make_video(item, tmp, state):
-    """Returns (path, w, h, dur, subtitled, fp) or None. `fp` is the content
-    fingerprint of the source clip - the caller records it in state on a
-    successful post so the same clip can't be reused for a later story."""
-    # ffmpeg/ffprobe must exist BEFORE anything is probed or merged
+    """Returns (path, w, h, dur, subtitled, fp) or None. None means: no acceptable
+    video for this story -> the caller falls back to photo/text."""
     font = ensure_tools()
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         log("no ffmpeg/ffprobe available even after install attempt - cannot post this video")
         return None
     got = fetch_video_source(item, tmp, state)
     if not got:
-        log("no playable (non-duplicate) video could be fetched for:", item["link"][:90])
+        log("no playable, matching, non-duplicate video could be fetched for:", item["link"][:90])
         return None
-    src, (w, h, dur, has_audio, vcodec), fp = got
-    log("video fetched: %dx%d %.0fs codec=%s audio=%s" % (w, h, dur, vcodec, has_audio))
+    src, (w, h, dur, has_audio, vcodec), fp, vtext, trusted = got
+    verified = True if vtext else None       # title/description already matched the story
+    log("video fetched: %dx%d %.0fs codec=%s audio=%s trusted=%s title_verified=%s"
+        % (w, h, dur, vcodec, has_audio, trusted, bool(vtext)))
+
+    def gate():
+        """A video that could not be verified is accepted only if it came straight
+        from this story's own RSS entry / og:video."""
+        if verified is None and not trusted:
+            log("video could not be verified as belonging to this story -> skipped")
+            return False
+        return True
 
     def plain():
         base = _ensure_mp4(tmp, src, vcodec)
         return (base, w, h, dur, False, fp) if base else None
-    if not font:
-        log("skipping subtitles for this video: no Persian font available")
-        return plain()
     segs = []
     if has_audio and left() > 120:
         wav = os.path.join(tmp, "a.wav")
@@ -1724,8 +1692,17 @@ def make_video(item, tmp, state):
                     if len(tx) < 2:
                         continue
                     raw.append((s.start, s.end, tx))
+                # spoken English must match the story, otherwise it is the wrong video
+                heard = " ".join(x[2] for x in raw)
+                if info.language == "en" and len(heard.split()) >= 8:
+                    if video_relates(item, heard, 2):
+                        verified = True
+                    else:
+                        log("video speech does not match the story -> rejected")
+                        return None
+                if not font:
+                    raw = []                 # no Persian font: no subtitles, verification only
                 # merge short fragments into fuller phrases before translating
-                # (isolated fragments translate into choppy, verbless subtitles)
                 groups = []
                 for start, end, tx in raw:
                     if (groups and len(groups[-1][2]) < 60
@@ -1734,12 +1711,8 @@ def make_video(item, tmp, state):
                         groups[-1] = (gs, end, (gt + " " + tx).strip())
                     else:
                         groups.append((start, end, tx))
-                # Translate EVERY phrase. The online engines (Google -> Libre ->
-                # MyMemory) can take 30-60s per phrase when rate-limited, and the
-                # old "if left() < 60: break" then silently dropped everything
-                # after the first few phrases (subtitles only for the first ~20s).
-                # Now: a translation deadline, and once we are slow or short on
-                # time the rest is translated with the offline Argos model.
+                # Translate EVERY phrase; once online engines are slow or time is short,
+                # the rest is translated with the offline Argos model.
                 tr_deadline = time.time() + max(60, left() - 170)
                 offline = False
                 for gs, ge, gt in groups:
@@ -1756,13 +1729,18 @@ def make_video(item, tmp, state):
                         except Exception:                        # noqa
                             fa = ""
                     if time.time() - t0 > 20:
-                        offline = True       # online engines are throttled: stop wasting time on them
+                        offline = True
                     if fa:
                         segs.append((gs, max(ge, gs + 1.0), fa))
                 log("subtitle segments: %d of %d phrases (offline fallback=%s)" % (len(segs), len(groups), offline))
         except Exception as ex:                                  # noqa
             log("whisper failed:", str(ex)[:200])
             segs = []
+    if not gate():
+        return None
+    if not font:
+        log("skipping subtitles for this video: no Persian font available")
+        return plain()
     if not segs:
         return plain()
     ass = os.path.join(tmp, "sub.ass")
@@ -1811,9 +1789,7 @@ def load_state():
 
 
 def recent_titles(state):
-    """Token sets of stories posted within HISTORY_H hours. Without this limit the
-    500-title history suppressed every new story on a recurring topic (Hormuz, talks...)
-    for days - 21 of 21 relevant items were being dropped as 'already posted'."""
+    """Token sets of stories posted within HISTORY_H hours."""
     now = time.time()
     seen = state.get("title_seen", {})
     return [set(t) for t in state["titles"]
@@ -1841,13 +1817,8 @@ def git_pull_quiet():
 
 
 def refresh_seen(state):
-    """Re-read state/posted.json from disk (after a git pull) right before
-    posting, and merge it into the in-memory state. Two runs can overlap
-    (the schedule fires every few minutes but a run with a video can take
-    most of TIME_BUDGET_SEC), and the in-memory state loaded at the start
-    of *this* run goes stale the moment another run pushes in the
-    meantime - that overlap, not a hole in the similarity/URL de-dup
-    logic itself, is what was letting the same story slip through twice."""
+    """Re-read state/posted.json from disk (after a git pull) right before posting and
+    merge it into the in-memory state, so overlapping runs don't repost the same story."""
     git_pull_quiet()
     fresh = load_state()
     for u in fresh.get("urls", []):
@@ -1870,18 +1841,15 @@ def refresh_seen(state):
 
 
 def git_push_state(state):
-    """Commit + push state/posted.json right now, not just at the end of the
-    workflow. If the job dies mid-run (15-min timeout, crash, cancelled
-    runner) after some posts already went to Telegram, this is what keeps
-    those posts recorded - otherwise the next run re-selects and re-posts
-    them, which is what was causing the duplicates."""
+    """Commit + push state/posted.json right after each post, so a crashed/cancelled
+    run can't cause the same story to be posted again."""
     save_state(state)
     try:
         subprocess.run(["git", "config", "user.name", "news-bot"], check=False)
         subprocess.run(["git", "config", "user.email", "news-bot@users.noreply.github.com"], check=False)
         subprocess.run(["git", "add", "state"], check=False)
         if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
-            return  # nothing changed, nothing to push
+            return
         subprocess.run(["git", "commit", "-m", "state [skip ci]"], check=False)
         for i in range(5):
             pulled = subprocess.run(["git", "pull", "--rebase", "-q"]).returncode == 0
@@ -1900,10 +1868,7 @@ def git_push_state(state):
 #  Posting one item
 # =====================================================================
 def post_item(item, allow_video, state):
-    # Read the article page for a summary only when the link is a REAL publisher
-    # URL. If the Google News link could not be resolved, scraping it returns
-    # Google's own generic page ("Comprehensive, up-to-date news coverage ...")
-    # and that sentence was being posted as the news summary.
+    # Read the article page for a summary only when the link is a REAL publisher URL.
     if not item["summary"] and left() > 60 and not _is_google_host(item["link"]):
         item["summary"] = fetch_page_summary(item["link"], item["title"])
         log("page summary: %s" % ("%d chars" % len(item["summary"]) if item["summary"] else "none (site blocked/empty)"))
@@ -1944,7 +1909,7 @@ def post_item(item, allow_video, state):
                     return "video"
                 log("sending the video to Telegram failed, falling back to photo/text")
             else:
-                log("video pipeline produced nothing, falling back to photo/text")
+                log("video pipeline produced nothing (no verified video), falling back to photo/text")
         except Exception as ex:                                  # noqa
             log("video pipeline failed:", str(ex)[:200])
         finally:
@@ -1987,9 +1952,7 @@ def main():
     for c in chosen[:10]:
         log("  [%2d] %s (%s) %s" % (c["total"], c["src"], c["tier"], c["title"][:90]))
 
-    # the (slow) video item goes first so its subtitling pipeline always
-    # gets the full time budget, instead of whatever's left after the
-    # other posts' translation retries/sleeps have eaten into it
+    # the (slow) video item goes first so its pipeline gets the full time budget
     todo = chosen[:MAX_POSTS]
     if ENABLE_VIDEO and MAX_VIDEOS > 0 and chosen:
         scan = [c for c in chosen[:VIDEO_SCAN] if not c.get("video") and not c.get("page_video")
@@ -1999,8 +1962,6 @@ def main():
                 list(ex.map(_scan_video, scan))
         vids = [c for c in chosen[:VIDEO_SCAN] if c.get("video") or c.get("page_video")]
         log("video candidates among the top %d items: %d" % (min(VIDEO_SCAN, len(chosen)), len(vids)))
-        # if none of today's posts has a video but a slightly lower-ranked item
-        # does, let it take the last slot so videos actually reach the channel
         if vids and not any(v is t for v in vids for t in todo):
             if len(todo) >= MAX_POSTS:
                 todo[-1] = vids[0]
@@ -2015,7 +1976,7 @@ def main():
             log("time budget reached")
             break
         if not DRY_RUN and i > 0:
-            refresh_seen(state)      # re-check right before each post, not just once at the top
+            refresh_seen(state)
         if it["link"] in state["urls"] or any(similar(it["tk"], o) for o in recent_titles(state)):
             log("skipping, already posted (concurrent run caught it first): %s" % it["title"][:80])
             continue
@@ -2071,7 +2032,6 @@ def selftest():
         flag = "OK " if a["ok"] == want else "BAD"
         bad += a["ok"] != want
         log("%s pts=%2d strong=%d med=%d %s" % (flag, a["pts"], a["strong"], a["medium"], title[:70]))
-    # Google News boilerplate must never be accepted as a summary
     for junk in ("Comprehensive, up-to-date news coverage, aggregated from sources all over the world by Google News.",
                  "Comprehensive up-to-date news coverage \u2013 aggregated from sources around the world by Google News",
                  "Google News",
@@ -2084,12 +2044,10 @@ def selftest():
     assert not _is_google_host("https://www.reuters.com/world/iran/story")
     assert _fa_is_boilerplate("پوشش جامع و به‌روز اخبار، جمع‌آوری‌شده از منابع مختلف توسط گوگل نیوز.")
     assert not _fa_is_boilerplate("ایران آمادگی خود را برای از سرگیری مذاکرات اعلام کرد.")
-    # glossary round trip with a fake translator that keeps the tokens
     fake = lambda s: s.replace("was seized", "توقیف شد")                 # noqa
     out = translate("IRGC seized a tanker in the Strait of Hormuz", fake)
     log("glossary:", out)
     assert "سپاه پاسداران" in out and "تنگه هرمز" in out
-    # translator that destroys the tokens -> must fall back
     calls = []
 
     def evil(s):
@@ -2097,34 +2055,32 @@ def selftest():
         return "خروجی " + re.sub(r"ZQ\d+QZ", "", s)
     out = translate("IRGC seized a tanker", evil)
     assert len(calls) == 2, calls
-    # de-dup similarity
     assert similar(toks("Iran resumes uranium enrichment at Fordow site"),
                    toks("Iran to resume enrichment at Fordow nuclear site, officials say"))
     assert not similar(toks("Oil prices rise on Hormuz fears"), toks("Apple unveils new iPhone today"))
-    # caption trimming
     it = dict(src_fa="رویترز", tier="A", link="https://x.com/a?b=1&c=2", also=["بی‌بی‌سی"], tags=["#ایران", "#نفت_و_انرژی"])
     cap = build_post(it, "عنوان " * 10, "متن طولانی " * 300, 1000)
     assert visible_len(cap) <= 1000, visible_len(cap)
-    # ASS build
     d = tempfile.mkdtemp()
     build_ass([(0.0, 2.5, "این یک زیرنویس آزمایشی است که باید در چند خط شکسته شود")], 1280, 720,
               "Vazirmatn", os.path.join(d, "s.ass"))
     assert "Dialogue" in open(os.path.join(d, "s.ass"), encoding="utf-8").read()
-    # entities must never reach the channel, even doubly encoded
     assert "&" not in fix_fa("&quot;test&quot; and &amp;quot;x&amp;quot; &#39;y&#39;")
     assert esc("&amp;quot;a&amp;quot;") == '"a"'
     assert esc("a & b < c") == "a &amp; b &lt; c"
-    # summaries are cut on sentence boundaries only
     assert trim_complete("Trump spoke at the U.S. Mission. He then said that the", 900) == "Trump spoke at the U.S. Mission."
     assert trim_complete("He said that the", 900) == ""
     assert build_post(it, "عنوان", "جمله اول است. جمله دوم " + "بلند " * 300 + ".", 400).count("بلند") == 0
-    # same photo under a different URL is caught by content
     st = {"img_fp": [["abc", 0b1011]]}
     assert img_is_dup(("abc", None), st) and img_is_dup(("zzz", 0b1010), st) and not img_is_dup(("zzz", (1 << 60) | 5), st)
-    # same check, for videos (a shared/reused clip must be caught the same way images are)
     stv = {"vid_fp": [["vabc", 0b1011]]}
     assert vid_is_dup(("vabc", None), stv) and vid_is_dup(("vzzz", 0b1010), stv) and not vid_is_dup(("vzzz", (1 << 60) | 5), stv)
     assert vid_looks_generic("https://cdn.example.com/hero-video.mp4") and not vid_looks_generic("https://cdn.example.com/najaf-flights.mp4")
+    # video must belong to the story (the Dubai-train-on-a-drug-bust-story bug)
+    drug = dict(title="Police seize drugs worth crores in Mumbai", summary="")
+    assert video_relates(drug, "Dubai metro train ride", 1) is False
+    assert video_relates(drug, "Mumbai police drugs bust", 1) is True
+    assert video_relates(drug, "The train leaves the station and arrives in Dubai downtown at noon today", 2) is False
     log("selftest finished, failures: %d" % bad)
     sys.exit(1 if bad else 0)
 
