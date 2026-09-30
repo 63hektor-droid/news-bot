@@ -2132,4 +2132,4 @@ if __name__ == "__main__":
         raise
     except Exception:                                            # noqa
         log("FATAL:\n" + traceback.format_exc())
-        sys.exit(1)ک
+        sys.exit(1)
