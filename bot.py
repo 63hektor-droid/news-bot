@@ -641,8 +641,9 @@ def select(items, state):
     now = datetime.now(timezone.utc)
     today_ir = now.astimezone(TEHRAN).date()
     pool = []
-    n_seen = n_future = n_notoday = 0
+    n_seen = n_future = n_notoday = n_pre = 0
     near_misses = []
+    staged = []
     for it in items:
         age = (now - it["time"]).total_seconds() / 3600.0
         if age < -1:
@@ -658,9 +659,30 @@ def select(items, state):
             continue
         if not it["summary"] and len(it["title"].split()) < 4:
             continue
-        # resolve Google News links only for items that passed scoring
-        if "news.google.com" in it["link"]:
-            it["link"] = normalize_link(resolve_gnews_link(it["link"]))
+        # Cheap title check BEFORE the slow Google-News link resolution: a story that
+        # is (almost) the same as something already posted would be suppressed below
+        # anyway, so don't spend HTTP requests on it.
+        tk_pre = toks(it["title"]) - common
+        if any(similar(tk_pre, o) for o in old):
+            n_pre += 1
+            if n_pre <= 5:
+                log("  suppressed early (same story as a recent post): %s" % it["title"][:80])
+            continue
+        it["_a"] = a
+        it["_age"] = age
+        staged.append(it)
+    # resolve Google News links in parallel, only for items that survived the checks above
+    gn_items = [it for it in staged if "news.google.com" in it["link"]]
+    if gn_items:
+        def _res(it):
+            try:
+                it["link"] = normalize_link(resolve_gnews_link(it["link"]))
+            except Exception:                                      # noqa
+                pass
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_res, gn_items))
+    for it in staged:
+        a, age = it.pop("_a"), it.pop("_age")
         if it["link"] in seen:
             n_seen += 1
             continue
@@ -703,8 +725,9 @@ def select(items, state):
             continue
         it["also"], it["dups"] = [], []
         chosen.append(it)
+    n_hist += n_pre
     log("de-dup: pool=%d | similar to already-posted=%d | duplicate of another candidate=%d | kept=%d"
-        % (len(pool), n_hist, n_dup, len(chosen)))
+        % (len(pool) + n_pre, n_hist, n_dup, len(chosen)))
     return pool, chosen
 
 
@@ -2109,4 +2132,4 @@ if __name__ == "__main__":
         raise
     except Exception:                                            # noqa
         log("FATAL:\n" + traceback.format_exc())
-        sys.exit(1)
+        sys.exit(1)ک
