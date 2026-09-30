@@ -672,8 +672,15 @@ def select(items, state):
     log("select: seen=%d future_ts=%d not_today=%d scored_candidates=%d near_misses=%d"
         % (n_seen, n_future, n_notoday, len(items) - n_future - n_notoday, len(near_misses)))
     near_misses.sort(key=lambda x: -x[0])
-    for pts, strong, medium, title in near_misses[:15]:
+    shown_nm = []
+    for pts, strong, medium, title in near_misses:
+        tk_nm = toks(title)
+        if any(similar(tk_nm, o) for o in shown_nm):     # same story from another agency
+            continue
+        shown_nm.append(tk_nm)
         log("  near-miss pts=%2d strong=%d med=%d  %s" % (pts, strong, medium, title[:90]))
+        if len(shown_nm) >= 15:
+            break
     pool.sort(key=lambda x: (-x["total"], x["rank"]))
     chosen = []
     n_hist = n_dup = 0
@@ -1781,11 +1788,13 @@ def load_state():
         s.setdefault("img_fp", [])
         s.setdefault("vid_fp", [])
         s.setdefault("title_seen", {})
+        s.setdefault("google_dead_until", 0.0)
         for t in s["titles"]:                     # legacy entries get stamped "now" and expire normally
             s["title_seen"].setdefault(" ".join(t), time.time())
         return s
     except Exception:                                            # noqa
-        return {"urls": [], "titles": [], "images": [], "img_fp": [], "vid_fp": [], "title_seen": {}}
+        return {"urls": [], "titles": [], "images": [], "img_fp": [], "vid_fp": [], "title_seen": {},
+                "google_dead_until": 0.0}
 
 
 def recent_titles(state):
@@ -1802,6 +1811,7 @@ def save_state(s):
     s["images"] = s.get("images", [])[-500:]
     s["img_fp"] = s.get("img_fp", [])[-500:]
     s["vid_fp"] = s.get("vid_fp", [])[-200:]
+    s["google_dead_until"] = max(float(s.get("google_dead_until", 0.0) or 0.0), _GOOGLE_DEAD_UNTIL)
     keep = {" ".join(t) for t in s["titles"]}
     s["title_seen"] = {k: v for k, v in s.get("title_seen", {}).items() if k in keep}
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
@@ -1819,8 +1829,11 @@ def git_pull_quiet():
 def refresh_seen(state):
     """Re-read state/posted.json from disk (after a git pull) right before posting and
     merge it into the in-memory state, so overlapping runs don't repost the same story."""
+    global _GOOGLE_DEAD_UNTIL
     git_pull_quiet()
     fresh = load_state()
+    _GOOGLE_DEAD_UNTIL = max(_GOOGLE_DEAD_UNTIL, float(fresh.get("google_dead_until", 0.0) or 0.0))
+    state["google_dead_until"] = _GOOGLE_DEAD_UNTIL
     for u in fresh.get("urls", []):
         if u not in state["urls"]:
             state["urls"].append(u)
@@ -1941,6 +1954,10 @@ def main():
     video_preflight()
 
     state = load_state()
+    global _GOOGLE_DEAD_UNTIL
+    _GOOGLE_DEAD_UNTIL = max(_GOOGLE_DEAD_UNTIL, float(state.get("google_dead_until", 0.0) or 0.0))
+    if _GOOGLE_DEAD_UNTIL > time.time():
+        log("Google translate paused from a previous run for another %ds" % (_GOOGLE_DEAD_UNTIL - time.time()))
     items, health = fetch_all(sources)
     bad = [h for h in health if h[2]]
     log("feeds ok: %d / %d" % (len(health) - len(bad), len(health)))
